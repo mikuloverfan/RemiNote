@@ -1,9 +1,9 @@
 {
   "id": "goodnote-max",
   "name": "GoodNote Max",
-  "version": "1.0.0",
+  "version": "2.0.1",
   "minAppVersion": "0.15.0",
-  "description": "Minimal plugin: ribbon button + Notice.",
-  "author": "Your Name",
+  "description": "A minimal and high-performance drawing & note enhancement plugin for Obsidian.",
+  "author": "mikuloverfan",
   "isDesktopOnly": false
 }
