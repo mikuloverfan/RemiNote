@@ -1,6 +1,6 @@
 {
   "id": "goodnote-max",
-  "name": "GoodNote Max",
+  "name": "GoodNotes Max",
   "version": "2.0.1",
   "minAppVersion": "0.15.0",
   "description": "A minimal and high-performance drawing & note enhancement plugin for Obsidian.",
