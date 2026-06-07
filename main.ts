@@ -1,5 +1,7 @@
 import { App, Plugin, Modal, Setting, ItemView, WorkspaceLeaf, Menu, Notice } from 'obsidian';
 
+declare const activeDocument: Document;
+
 // ============================================================
 //  Phase 2-A: Constants Layer — 所有魔法数字集中管理
 // ============================================================
@@ -249,7 +251,7 @@ class CursorRenderer {
 
   constructor(session: CanvasSession | null, ownerDocument?: Document) {
     this._session = session;
-    this._doc = ownerDocument ?? (globalThis as unknown as { activeDocument?: Document }).activeDocument ?? document;
+    this._doc = ownerDocument ?? activeDocument;
   }
 
   /** Bind or rebind session. Safe to call multiple times. */
@@ -798,7 +800,7 @@ class FileGateway {
       }
     } catch (e) {
       console.warn('[BOOT] adapter.exists failed:', e);
-      try { await this.app.vault.createFolder(dir); } catch (_) {}
+      try { await this.app.vault.createFolder(dir); } catch (e2) { console.debug(e2); }
       return [];
     }
 
@@ -870,20 +872,22 @@ class NotebookModal extends Modal {
     new Setting(contentEl).setName('Notebook name').addText((t) =>
       t.setPlaceholder('Enter notebook name').onChange((v) => { name = v; }));
     new Setting(contentEl)
-      .addButton((b) => b.setButtonText('Create').setCta().onClick(async () => {
-        try {
-          const now = new Date().toISOString();
-          await this.plugin.addNotebook({
-            id: genId(), name: name || 'Untitled',
-            pages: [{
-              id: 'page-1', title: 'Page 1', index: 0,
-              strokes: [], background: { type: 'blank', color: '#ffffff' },
+      .addButton((b) => b.setButtonText('Create').setCta().onClick(() => {
+        (async () => {
+          try {
+            const now = new Date().toISOString();
+            await this.plugin.addNotebook({
+              id: genId(), name: name || 'Untitled',
+              pages: [{
+                id: 'page-1', title: 'Page 1', index: 0,
+                strokes: [], background: { type: 'blank', color: '#ffffff' },
+                createdAt: now, updatedAt: now,
+              }],
+              activePageId: 'page-1', nextPageIndex: 1,
               createdAt: now, updatedAt: now,
-            }],
-            activePageId: 'page-1', nextPageIndex: 1,
-            createdAt: now, updatedAt: now,
-          });
-        } catch (e) { console.error(e); } finally { this.close(); }
+            });
+          } catch (e) { console.error(e); } finally { this.close(); }
+        })().catch(() => {});
       }))
       .addButton((b) => b.setButtonText('Cancel').onClick(() => this.close()));
   }
@@ -903,7 +907,7 @@ class NotebookRenameModal extends Modal {
     new Setting(contentEl).setName('Notebook name').addText((t) => t.setValue(this.cur).onChange((x) => v = x));
     new Setting(contentEl)
       .addButton((b) => b.setButtonText('Rename').setCta().onClick(() => {
-        try { this.plugin.renameNotebook(this.nbId, v || this.cur); } catch (e) { console.error(e); } finally { this.close(); }
+        try { void this.plugin.renameNotebook(this.nbId, v || this.cur); } catch (e) { console.error(e); } finally { this.close(); }
       }))
       .addButton((b) => b.setButtonText('Cancel').onClick(() => this.close()));
   }
@@ -922,8 +926,10 @@ class RenameModal extends Modal {
     let v = this.cur;
     new Setting(contentEl).setName('Page title').addText((t) => t.setValue(this.cur).onChange((x) => v = x));
     new Setting(contentEl)
-      .addButton((b) => b.setButtonText('Rename').setCta().onClick(async () => {
-        try { await this.plugin.renamePage(this.nbId, this.pId, v || this.cur); } catch (e) { console.error(e); } finally { this.close(); }
+      .addButton((b) => b.setButtonText('Rename').setCta().onClick(() => {
+        (async () => {
+          try { await this.plugin.renamePage(this.nbId, this.pId, v || this.cur); } catch (e) { console.error(e); } finally { this.close(); }
+        })().catch(() => {});
       }))
       .addButton((b) => b.setButtonText('Cancel').onClick(() => this.close()));
   }
@@ -960,13 +966,13 @@ class NotebookView extends ItemView {
       const li = this.listEl.createEl('li');
       if (nb.id === sid) li.addClass('is-selected');
       li.createSpan({ text: `${nb.isPinned ? '📌' : '📒'} ${nb.name}` });
-      li.createEl('button', { text: '🗑' }).onclick = () => this.plugin.deleteNotebook(nb.id);
+      li.createEl('button', { text: '🗑' }).onclick = () => { void this.plugin.deleteNotebook(nb.id); };
       li.addEventListener('contextmenu', (ev) => {
         ev.preventDefault();
         new Menu()
           .addItem((i) => i.setTitle(nb.isPinned ? 'Unpin' : 'Pin').setIcon('pin').onClick(() => this.plugin.togglePinNotebook(nb.id)))
           .addItem((i) => i.setTitle('Rename').setIcon('pencil').onClick(() => new NotebookRenameModal(this.plugin.app, this.plugin, nb.id, nb.name).open()))
-          .addItem((i) => i.setTitle('Delete').setIcon('trash').onClick(() => this.plugin.deleteNotebook(nb.id)))
+          .addItem((i) => i.setTitle('Delete').setIcon('trash').onClick(() => { void this.plugin.deleteNotebook(nb.id); }))
           .showAtMouseEvent(ev);
       });
       li.onclick = () => { new Notice(`📒 ${nb.name}`); this.plugin.ui.selectNotebook(nb.id); };
@@ -1375,7 +1381,7 @@ class PageManager {
     // 通过 Plugin 调度（不直接操作 CanvasSession）
     this.plugin.requestPageChange(notebookId, page.id);
 
-    this.saveNotebook(nb);
+    void this.saveNotebook(nb);
     return page;
   }
 
@@ -1412,7 +1418,7 @@ class PageManager {
       }
     }
 
-    this.saveNotebook(nb);
+    void this.saveNotebook(nb);
     return true;
   }
 
@@ -1450,7 +1456,7 @@ class PageManager {
     page.updatedAt = new Date().toISOString();
     nb.updatedAt = page.updatedAt;
 
-    this.saveNotebook(nb);
+    void this.saveNotebook(nb);
     return true;
   }
 
@@ -1474,7 +1480,7 @@ class PageManager {
       this.plugin.requestPageChange(notebookId, pageId);
     }
 
-    this.saveNotebook(nb);
+    void this.saveNotebook(nb);
     return true;
   }
 
@@ -1493,7 +1499,7 @@ class PageManager {
     nb.pages.forEach((p, i) => { p.index = i; });
     nb.updatedAt = new Date().toISOString();
 
-    this.saveNotebook(nb);
+    void this.saveNotebook(nb);
     return true;
   }
 
@@ -1521,7 +1527,7 @@ class PageManager {
     nb.nextPageIndex = nb.pages.length;
     nb.updatedAt = now;
 
-    this.saveNotebook(nb);
+    void this.saveNotebook(nb);
 
     // 自动切换到新页面
     this.switchPage(notebookId, copy.id);
@@ -3804,7 +3810,7 @@ export default class GoodNoteMaxPlugin extends Plugin {
     this.emit('selection-changed');
   }
 
-  togglePinNotebook(id: string) { const nb = this.notebooks.find((n) => n.id === id); if (!nb) return; nb.isPinned = !nb.isPinned; this.fileGateway.saveNotebook(nb); this.emit('notebooks-changed'); }
+  togglePinNotebook(id: string) { const nb = this.notebooks.find((n) => n.id === id); if (!nb) return; nb.isPinned = !nb.isPinned; void this.fileGateway.saveNotebook(nb); this.emit('notebooks-changed'); }
 
   private async resolveNotebookPath(id: string): Promise<string | undefined> {
     const adapter = this.app.vault.adapter;
@@ -3813,7 +3819,7 @@ export default class GoodNoteMaxPlugin extends Plugin {
       try {
         const raw = await adapter.read(f);
         if (JSON.parse(raw).id === id) return f;
-      } catch (_) {}
+      } catch (e) { console.debug(e); }
     }
     return undefined;
   }
@@ -3886,7 +3892,7 @@ export default class GoodNoteMaxPlugin extends Plugin {
         if (!nb.updatedAt) nb.updatedAt = Date.now();
         this.notebooks.push(nb);
         this.emit('notebooks-changed');
-      } catch (_) {}
+      } catch (e) { console.debug(e); }
       return;
     }
 
@@ -3908,7 +3914,7 @@ export default class GoodNoteMaxPlugin extends Plugin {
         Object.assign(existing, nb);
         existing.pages = preservedStrokes;
         this.emit('notebooks-changed');
-      } catch (_) {}
+      } catch (e) { console.debug(e); }
       return;
     }
 
@@ -3930,7 +3936,7 @@ export default class GoodNoteMaxPlugin extends Plugin {
         Object.assign(existing, nb);
         existing.pages = preservedStrokes;
         this.emit('notebooks-changed');
-      } catch (_) {}
+      } catch (e) { console.debug(e); }
       return;
     }
   }
@@ -3960,7 +3966,7 @@ export default class GoodNoteMaxPlugin extends Plugin {
     this.pageManager.deletePage(nbId, pId);
   }
 
-  recordLastPage(nbId: string, pId: string) { const nb = this.notebooks.find((n) => n.id === nbId); if (!nb) return; nb.lastPageId = pId; this.fileGateway.saveNotebook(nb); }
+  recordLastPage(nbId: string, pId: string) { const nb = this.notebooks.find((n) => n.id === nbId); if (!nb) return; nb.lastPageId = pId; void this.fileGateway.saveNotebook(nb); }
 
   /**
    * 单向调度：Page 数据变更 → Session 状态重建。
@@ -4051,7 +4057,7 @@ export default class GoodNoteMaxPlugin extends Plugin {
     // ==========================================================
     window.setInterval(() => {
       const registry = CanvasSessionRegistry.getInstance();
-      const canvasCount = ((globalThis as unknown as { activeDocument?: Document }).activeDocument ?? document).querySelectorAll('canvas').length;
+      const canvasCount = activeDocument.querySelectorAll('canvas').length;
       const sessionAlive = !!(registry.activeSession && !registry.activeSession.destroyed);
 
       console.assert(sessionAlive || canvasCount === 0,

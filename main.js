@@ -88,15 +88,16 @@ function clampZoom(zoom) {
   return Math.max(CAMERA_CONSTANTS.MIN_ZOOM, Math.min(CAMERA_CONSTANTS.MAX_ZOOM, zoom));
 }
 function migratePage(raw) {
+  const r = raw;
   return {
-    id: raw.id || genId(),
-    title: raw.title || "Untitled",
-    index: raw.index ?? 0,
-    strokes: raw.strokes || raw.content?.strokes || [],
-    background: raw.background || { type: "blank", color: "#ffffff" },
-    createdAt: raw.createdAt || (/* @__PURE__ */ new Date()).toISOString(),
-    updatedAt: raw.updatedAt || (/* @__PURE__ */ new Date()).toISOString(),
-    thumbnail: raw.thumbnail
+    id: r.id || genId(),
+    title: r.title || "Untitled",
+    index: r.index ?? 0,
+    strokes: r.strokes || r.content?.strokes || [],
+    background: r.background || { type: "blank", color: "#ffffff" },
+    createdAt: r.createdAt || (/* @__PURE__ */ new Date()).toISOString(),
+    updatedAt: r.updatedAt || (/* @__PURE__ */ new Date()).toISOString(),
+    thumbnail: r.thumbnail
   };
 }
 var CursorRenderer = class {
@@ -105,7 +106,7 @@ var CursorRenderer = class {
     this._mounted = false;
     this._session = null;
     this._session = session;
-    this._doc = ownerDocument ?? document;
+    this._doc = ownerDocument ?? globalThis.activeDocument ?? document;
   }
   /** Bind or rebind session. Safe to call multiple times. */
   bindSession(session) {
@@ -444,17 +445,18 @@ var HandTool = class {
   }
 };
 function migrateNotebook(raw) {
+  const r = raw;
   const now = (/* @__PURE__ */ new Date()).toISOString();
   return {
-    id: raw.id || genId(),
-    name: raw.name || "Untitled",
-    pages: (raw.pages || []).map((p) => migratePage(p)),
-    activePageId: raw.activePageId ?? (raw.pages?.[0]?.id ?? null),
-    nextPageIndex: raw.nextPageIndex ?? (raw.pages?.length ?? 0),
-    createdAt: raw.createdAt || now,
-    updatedAt: raw.updatedAt || now,
-    lastPageId: raw.lastPageId,
-    isPinned: raw.isPinned
+    id: r.id || genId(),
+    name: r.name || "Untitled",
+    pages: (r.pages || []).map((p) => migratePage(p)),
+    activePageId: r.activePageId ?? r.pages?.[0]?.id ?? null,
+    nextPageIndex: r.nextPageIndex ?? (r.pages?.length ?? 0),
+    createdAt: r.createdAt || now,
+    updatedAt: r.updatedAt || now,
+    lastPageId: r.lastPageId,
+    isPinned: r.isPinned
   };
 }
 var NOTEBOOK_VIEW_TYPE = "goodnote-max-notebook-view";
@@ -972,7 +974,7 @@ var CanvasLayoutManager = class {
       leaf = workspace.getLeaf(false);
       await leaf.setViewState({ type: CANVAS_VIEW_TYPE, active: true });
     } else {
-      workspace.revealLeaf(leaf);
+      workspace.setActiveLeaf(leaf, { focus: true });
     }
     const view = leaf.view;
     view.createSession(notebookId, pageId);
@@ -2192,7 +2194,8 @@ var CanvasSession = class {
     const page = nb?.pages.find((p) => p.id === pageId);
     const strokes = page?.strokes ?? [];
     this.engine.load(notebookId, pageId, strokes);
-    this.engine.on("commit", (payload) => {
+    this.engine.on("commit", (raw) => {
+      const payload = raw;
       if (!payload)
         return;
       const nb2 = plugin.getNotebooks().find((n) => n.id === payload.notebookId);
@@ -3321,7 +3324,7 @@ var GoodNoteMaxPlugin = class extends import_obsidian.Plugin {
     vault.on("modify", (file) => this.handleVaultEvent("modify", file));
     window.setInterval(() => {
       const registry = CanvasSessionRegistry.getInstance();
-      const canvasCount = document.querySelectorAll("canvas").length;
+      const canvasCount = (globalThis.activeDocument ?? document).querySelectorAll("canvas").length;
       const sessionAlive = !!(registry.activeSession && !registry.activeSession.destroyed);
       console.assert(
         sessionAlive || canvasCount === 0,
@@ -3352,13 +3355,13 @@ var GoodNoteMaxPlugin = class extends import_obsidian.Plugin {
       if (leaf)
         await leaf.setViewState({ type: NOTEBOOK_VIEW_TYPE, active: true });
     } else
-      workspace.revealLeaf(l);
+      workspace.setActiveLeaf(l, { focus: true });
     let r = workspace.getLeavesOfType(PAGE_VIEW_TYPE)[0];
     if (!r) {
       const leaf = workspace.getRightLeaf(false);
       if (leaf)
         await leaf.setViewState({ type: PAGE_VIEW_TYPE, active: true });
     } else
-      workspace.revealLeaf(r);
+      workspace.setActiveLeaf(r, { focus: true });
   }
 };
