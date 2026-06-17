@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Stroke Width Prototype</title>
+<style>
+body{font-family:system-ui;padding:20px;background:#1a1a2e;color:#eee}
+canvas{background:#fff;border-radius:8px;margin:8px}
+.row{display:flex;gap:16px;flex-wrap:wrap}
+.label{font-size:12px;color:#aaa;margin:4px 0}
+</style></head><body>
+<h2>Variable-Width Stroke Prototype</h2>
+<div class="row">
+<div><div class="label">A: Uniform lineWidth (current)</div><canvas id="cA" width="400" height="120"></canvas></div>
+<div><div class="label">B: Stamped circles (per-point radius)</div><canvas id="cB" width="400" height="120"></canvas></div>
+</div>
+<div class="row">
+<div><div class="label">C: Segmented lines (tapered ends)</div><canvas id="cC" width="400" height="120"></canvas></div>
+<div><div class="label">D: Segmented + direction-aware (竖粗横细)</div><canvas id="cD" width="400" height="120"></canvas></div>
+</div>
+<div class="row">
+<div><div class="label">E: Speed-based (fast=thin, slow=thick)</div><canvas id="cE" width="400" height="120"></canvas></div>
+<div><div class="label">F: Combined: taper + direction + speed</div><canvas id="cF" width="400" height="120"></canvas></div>
+</div>
+<script>
+// Test strokes: a curve + straight + curved
+const strokes = [
+  // "S" curve
+  Array.from({length:40},(_,i)=>{const t=i/39;return{x:50+t*120,y:60+Math.sin(t*Math.PI*2)*30,t:t*500}}),
+  // Horizontal
+  Array.from({length:30},(_,i)=>({x:200+i*150/29,y:60,t:i*10})),
+  // Vertical (thicker downstroke)
+  Array.from({length:20},(_,i)=>({x:360,y:10+i*100/19,t:i*15})),
+];
+
+function computeWidths(points, baseW, taper, direction, speed) {
+  const n=points.length; const w=new Array(n);
+  for(let i=0;i<n;i++){
+    let bw=baseW;
+    // Taper at ends
+    if(taper&&n>8){const tl=Math.min(6,Math.floor(n/5));const t=Math.min(i/n,(n-1-i)/n);bw*=0.3+0.7*Math.min(t/(tl/n),1)}
+    // Direction: downstroke thicker
+    if(direction&&i>0){const dy=points[i].y-points[i-1].y;bw*=0.7+0.6*Math.max(0,dy/Math.hypot(points[i].x-points[i-1].x||0.1,dy||0.1))}
+    // Speed: faster thinner
+    if(speed&&i>0){const dt=(points[i].t||i)-(points[i-1].t||i-1);const dist=Math.hypot(points[i].x-points[i-1].x,points[i].y-points[i-1].y);const spd=dt>0?dist/dt*1000:50;bw*=Math.min(1.5,Math.max(0.5,50/spd))}
+    w[i]=Math.max(0.3,bw);
+  }
+  return w;
+}
+
+function drawUniform(ctx,pts,baseW){ctx.beginPath();ctx.lineWidth=baseW;ctx.lineCap='round';ctx.lineJoin='round';ctx.moveTo(pts[0].x,pts[0].y);for(let i=1;i<pts.length;i++)ctx.lineTo(pts[i].x,pts[i].y);ctx.stroke()}
+function drawStamped(ctx,pts,widths){for(let i=0;i<pts.length;i++){ctx.beginPath();ctx.fillStyle='#000';ctx.arc(pts[i].x,pts[i].y,widths[i]*2.5,0,Math.PI*2);ctx.fill()}}
+function drawSegmented(ctx,pts,widths){for(let i=1;i<pts.length;i++){ctx.beginPath();ctx.lineWidth=widths[i]*2;ctx.lineCap='round';ctx.moveTo(pts[i-1].x,pts[i-1].y);ctx.lineTo(pts[i].x,pts[i].y);ctx.stroke()}}
+
+for(const s of strokes){
+  const ctxA=document.getElementById('cA').getContext('2d');
+  drawUniform(ctxA,s,3);
+  const ctxB=document.getElementById('cB').getContext('2d');
+  const wB=computeWidths(s,3,true,false,false);
+  drawStamped(ctxB,s,wB);
+  const ctxC=document.getElementById('cC').getContext('2d');
+  const wC=computeWidths(s,3,true,false,false);
+  drawSegmented(ctxC,s,wC);
+  const ctxD=document.getElementById('cD').getContext('2d');
+  const wD=computeWidths(s,3,true,true,false);
+  drawSegmented(ctxD,s,wD);
+  const ctxE=document.getElementById('cE').getContext('2d');
+  const wE=computeWidths(s,3,false,false,true);
+  drawSegmented(ctxE,s,wE);
+  const ctxF=document.getElementById('cF').getContext('2d');
+  const wF=computeWidths(s,3,true,true,true);
+  drawSegmented(ctxF,s,wF);
+}
+</script>
+</body></html>

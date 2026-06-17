@@ -1,5 +1,5 @@
 
-# 📄 GoodNotes-Max
+# 📄 RemiNote
 
 > High-performance handwriting & canvas system for Obsidian.
 
@@ -7,7 +7,7 @@
 
 ## ✨ Overview
 
-**GoodNotes-Max** is a high-performance handwriting and infinite canvas system built for Obsidian.
+**RemiNote** is a high-performance handwriting and infinite canvas system built for Obsidian.
 
 It brings a GoodNotes-like writing experience directly into your vault, with a fully custom rendering engine, deterministic input system, and real-time stroke pipeline.
 
@@ -60,7 +60,7 @@ Designed for precision writing, sketching, and structured visual notes.
 ## 🖊️ Usage
 
 1. Open any note in Obsidian
-2. Enable **GoodNotes-Max canvas view**
+2. Enable **RemiNote canvas view**
 3. Use toolbar to select tools:
 
    * ✍️ Pen — draw strokes
@@ -81,7 +81,7 @@ Designed for precision writing, sketching, and structured visual notes.
 2. Extract into your vault:
 
 ```text
-VaultFolder/.obsidian/plugins/GoodNotes-Max/
+VaultFolder/.obsidian/plugins/RemiNote/
 ```
 
 3. Restart Obsidian

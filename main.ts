@@ -1,4 +1,25 @@
-import { App, Plugin, Modal, Setting, ItemView, WorkspaceLeaf, Menu, Notice } from 'obsidian';
+﻿import { App, Plugin, Modal, Setting, ItemView, WorkspaceLeaf, Menu, Notice } from 'obsidian';
+import { UIRuntimeStabilizer } from './src/core/shadow/ui/UIRuntimeStabilizer';
+import { RuntimeOrchestrator } from './src/core/orchestrator/RuntimeOrchestrator';
+import { CanvasUIController } from './src/core/orchestrator/CanvasUIController';
+import { pointerState, dualInput, bindCanvas, startPointerStream, stopPointerStream, isInCanvas, tickSmoothing, bindCursorDocument, bindViewportCamera } from './src/core/input/CoordinateInputSystem';
+import DebugBus from './src/core/debug/DebugBus';
+import { beautifyStroke, beautifyWidths, DEFAULT_BEAUTIFY_CONFIG, strengthToConfig } from './src/core/beautify/StrokeBeautifyEngine';
+import type { BeautifyConfig } from './src/core/beautify/StrokeBeautifyEngine';
+import { RedrawOrchestrator } from './src/core/beautify/RedrawOrchestrator';
+import type { FontStyleId } from './src/core/beautify/RedrawOrchestrator';
+import { buildStrokeGeometry, drawGeometryToCanvas2D, type Point2D } from './src/core/render/StrokeGeometryEngine';
+
+// 🔴 Global debug switch
+const DEBUG = false;
+
+function installDebugGuard(): void {
+  if (DEBUG) return;
+  console.log = () => {};
+  console.warn = () => {};
+  console.debug = () => {};
+  // console.error preserved for real failures
+}
 
 declare const activeDocument: Document;
 
@@ -11,9 +32,27 @@ const CANVAS_CONSTANTS = {
   SPEED_NORMALIZATION: 3,
   JITTER_THRESHOLD: 5,
   CURVATURE_NORMALIZATION: 10,
-  MIN_STROKE_WIDTH: 0.6,
-  MAX_STROKE_WIDTH: 3.5,
+  MIN_STROKE_WIDTH: 0.3,
+  MAX_STROKE_WIDTH: 14,
 } as const;
+
+// ============================================================
+//  ✨ Beautify Engine — global singleton config
+// ============================================================
+
+const beautifyConfig: BeautifyConfig = { ...DEFAULT_BEAUTIFY_CONFIG };
+const redrawOrchestrator = new RedrawOrchestrator();
+
+function toggleBeautify(): boolean {
+  beautifyConfig.enabled = !beautifyConfig.enabled;
+  redrawOrchestrator.config.enabled = beautifyConfig.enabled;
+  if (beautifyConfig.enabled) {
+    Object.assign(beautifyConfig, strengthToConfig(beautifyConfig.strength));
+  } else {
+    redrawOrchestrator.reset();
+  }
+  return beautifyConfig.enabled;
+}
 
 // ============================================================
 //  Data interfaces
@@ -45,7 +84,7 @@ interface StrokePenState {
 
 interface Stroke {
   id: string;
-  points: { x: number; y: number; t?: number; speed?: number }[];
+  points: { x: number; y: number; t?: number; speed?: number; pressure?: number }[];
   color: string;
   width: number;
   /** Immutable pen snapshot — captured at stroke creation, never changes */
@@ -54,6 +93,9 @@ interface Stroke {
     smoothness: number;
     strokeWidth: number;
     cornerKeep: number;
+    opacity?: number;
+    color?: string;
+    brushType?: string;
   };
   debug?: StrokeDebug;
   replay?: {
@@ -62,6 +104,16 @@ interface Stroke {
   };
   quality?: StrokeQuality;
   penState?: StrokePenState;
+  /** 🎯 Glyph rendering: when set, the renderer draws this character using fillText instead of stroke path */
+  _glyph?: {
+    char: string;
+    fontFamily: string;
+    /** World-space bounding box to render into */
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  };
 }
 
 type InkMode = 'raw' | 'assist' | 'ai';
@@ -211,6 +263,10 @@ interface HandwritingParams {
   smoothness: number;
   strokeWidth: number;
   cornerKeep: number;
+  opacity: number;
+  color: string;
+  /** 笔刷类型: 'brush-pen' (毛笔) | 'ps-default' (PS默认) */
+  brushType: string;
   dynamicInk: {
     enabled: boolean;
     strength: number;
@@ -243,7 +299,6 @@ interface UICursorState {
 class CursorRenderer {
   private el!: HTMLDivElement;
   private _onGlobalPointerMove!: (ev: PointerEvent) => void;
-  private _onGlobalPointerLeave!: () => void;
   private _unsub: (() => void) | null = null;
   private _mounted = false;
   private _session: CanvasSession | null = null;
@@ -259,6 +314,8 @@ class CursorRenderer {
     // Unsubscribe previous session if any
     if (this._unsub) { this._unsub(); this._unsub = null; }
     this._session = session;
+    // 🔗 Shared projection: cursor and stroke use the same camera for screen↔world transforms
+    bindViewportCamera(session.viewport.camera);
     if (this._mounted) {
       this._subscribeViewState();
       // Force initial sync
@@ -268,46 +325,52 @@ class CursorRenderer {
 
   /** Mount the cursor overlay into document.body. Safe to call before session exists. */
   mount(): void {
+    // 🔒 Singleton lock — only one cursor DOM allowed globally.
+    // Verify DOM still exists: plugin reload destroys old DOM but lock may persist.
+    const existingDOM = this._doc.querySelector('.reminote-cursor-overlay');
+    if ((window as any).__REMINOTE_CURSOR_SINGLETON__ && existingDOM) {
+      console.warn('[Cursor] duplicate mount blocked — cursor already exists in DOM');
+      return;
+    }
+
+    // 🧹 Kill orphan cursor instances (lock was stale, DOM orphaned by reload)
+    if ((window as any).__REMINOTE_CURSOR_SINGLETON__ && !existingDOM) {
+      console.warn('[Cursor] stale singleton lock cleared — DOM was removed by reload');
+      (window as any).__REMINOTE_CURSOR_SINGLETON__ = false;
+    }
+    (window as any).__REMINOTE_CURSOR_SINGLETON__ = true;
+
     if (this._mounted) return;
     this._mounted = true;
 
-    // Singleton guard — remove any existing cursor overlay
-    const existing = this._doc.querySelector('.goodnote-cursor-overlay');
-    if (existing) existing.remove();
+    // 🧹 Kill all old cursor instances before creating new one
+    this._doc.querySelectorAll('.reminote-cursor-overlay').forEach(el => el.remove());
 
-    this.el = this._doc.body.createEl('div', { cls: 'goodnote-cursor-overlay' });
+    // 🎯 Ensure UI layer exists, then mount cursor inside it
+    let uiLayer = this._doc.getElementById('reminote-ui-layer');
+    if (!uiLayer) {
+      uiLayer = this._doc.createElement('div');
+      uiLayer.id = 'reminote-ui-layer';
+      uiLayer.className = 'reminote-ui-layer';
+      this._doc.body.appendChild(uiLayer);
+    }
+
+    this.el = this._doc.createElement('div');
+    this.el.className = 'reminote-cursor-overlay cursor-pen';
+    uiLayer.appendChild(this.el);
+
+    // 🔗 Bind cursor document so renderCursor() queries the correct document
+    bindCursorDocument(this._doc);
 
     // Subscribe if session already available
     if (this._session) {
       this._subscribeViewState();
     }
 
-    // ── Global pointermove (window-level, never disconnected) ──
-    this._onGlobalPointerMove = (ev: PointerEvent) => {
-      if (!this.el || !this._doc.body.contains(this.el)) {
-        this.el = this._doc.body.createEl('div', { cls: 'goodnote-cursor-overlay' });
-      }
-      this.el.style.setProperty('--cursor-x', ev.clientX + 'px');
-      this.el.style.setProperty('--cursor-y', ev.clientY + 'px');
-      this.el.classList.remove('cursor-hidden');
-      // Write back to viewState if session available
-      if (this._session) {
-        const vs = this._session.viewState.cursor;
-        vs.x = ev.clientX;
-        vs.y = ev.clientY;
-        vs.visible = true;
-      }
-    };
-    window.addEventListener('pointermove', this._onGlobalPointerMove);
-
-    // ── Document-level leave (pointer exits the page) ──
-    this._onGlobalPointerLeave = () => {
-      if (this.el) this.el.classList.add('cursor-hidden');
-      if (this._session) {
-        this._session.viewState.cursor.visible = false;
-      }
-    };
-    this._doc.addEventListener('pointerleave', this._onGlobalPointerLeave);
+    // 🟢 Cursor driven directly by pointermove in CoordinateInputSystem — zero latency.
+    // No RAF, no smoothing, no canvas. Pure DOM transform on rawX/rawY.
+    if ((window as any).__CURSOR_MOVE_LOCK__) return;
+    (window as any).__CURSOR_MOVE_LOCK__ = true;
   }
 
   /** Subscribe to session viewState for tool-driven appearance. */
@@ -341,12 +404,7 @@ class CursorRenderer {
           break;
       }
 
-      // Visibility
-      if (cs.visible) {
-        this.el.classList.remove('cursor-hidden');
-      } else {
-        this.el.classList.add('cursor-hidden');
-      }
+      // 🟦 Visibility handled by RAF opacity — no class toggle
     });
 
     // Force initial sync
@@ -357,8 +415,8 @@ class CursorRenderer {
   destroy(): void {
     this._mounted = false;
     if (this._unsub) { this._unsub(); this._unsub = null; }
-    if (this._onGlobalPointerMove) window.removeEventListener('pointermove', this._onGlobalPointerMove);
-    if (this._onGlobalPointerLeave) this._doc.removeEventListener('pointerleave', this._onGlobalPointerLeave);
+    (window as any).__CURSOR_MOVE_LOCK__ = false;
+    (window as any).__REMINOTE_CURSOR_SINGLETON__ = false;
     if (this.el && this._doc.body.contains(this.el)) this.el.remove();
     this._session = null;
   }
@@ -490,13 +548,16 @@ class PenTool implements ITool {
   settings: HandwritingParams = CanvasPolicy.getDefaults();
 
   onPointerDown(snapshot: InputSnapshot, session: CanvasSession): void {
-    const pt = { x: snapshot.pointer.worldX, y: snapshot.pointer.worldY };
-    session.engine.startStroke(pt, snapshot.pointer.pointerId, (id) => session.canvasEl.setPointerCapture(id));
+    // 🟢 Use cursor's exact screen coords (dualInput.rawX/Y) for zero-offset stroke start.
+    // This ensures stroke origin = cursor position — same input source, same screen→world transform.
+    const canvasRect = session.canvasEl.getBoundingClientRect();
+    const world = session.viewport.screenToWorld(dualInput.rawX, dualInput.rawY, canvasRect);
+    session.engine.startStroke({ x: world.x, y: world.y, pressure: snapshot.pointer.pressure }, snapshot.pointer.pointerId, (id) => session.canvasEl.setPointerCapture(id));
   }
 
   onPointerMove(snapshot: InputSnapshot, session: CanvasSession): void {
     if (!session.engine.drawing) return;
-    const pt = { x: snapshot.pointer.worldX, y: snapshot.pointer.worldY };
+    const pt = { x: snapshot.pointer.worldX, y: snapshot.pointer.worldY, pressure: snapshot.pointer.pressure };
     session.engine.addPoint(pt);
     const strokeId = session.engine.currentStrokeId;
     const prev = session.engine.lastPoint;
@@ -517,6 +578,8 @@ class PenTool implements ITool {
     } else {
       session.markDirty();
     }
+    // 🟦 Redraw: schedule deferred full rebuild if beautify redraw is enabled
+    redrawOrchestrator.onStrokeEnd(session as any);
   }
 }
 
@@ -744,9 +807,9 @@ function migrateNotebook(raw: unknown): Notebook {
   };
 }
 
-const NOTEBOOK_VIEW_TYPE = 'goodnote-max-notebook-view';
-const PAGE_VIEW_TYPE = 'goodnote-max-page-view';
-const CANVAS_VIEW_TYPE = 'goodnote-max-canvas-view';
+const NOTEBOOK_VIEW_TYPE = 'reminote-notebook-view';
+const PAGE_VIEW_TYPE = 'reminote-page-view';
+const CANVAS_VIEW_TYPE = 'reminote-canvas-view';
 
 let _idCounter = Date.now();
 function genId(): string { return `${++_idCounter}`; }
@@ -756,14 +819,14 @@ function genId(): string { return `${++_idCounter}`; }
 // ============================================================
 
 class FileGateway {
-  private static DIR = 'GoodNoteMax';
+  public static DIR = 'RemiNote';
 
   constructor(private app: App) {}
 
-  /** Normalize: strip double-prefix, backslash→slash, ensure single GoodNoteMax/ prefix. */
+  /** Normalize: strip double-prefix, backslash→slash, ensure single RemiNote/ prefix. */
   private normalizePath(raw: string): string {
     let p = raw.replace(/\\/g, '/');
-    // Fix double-prefix: GoodNoteMax/GoodNoteMax/ → GoodNoteMax/
+    // Fix double-prefix: RemiNote/RemiNote/ → RemiNote/
     while (p.startsWith(`${FileGateway.DIR}/${FileGateway.DIR}/`)) {
       p = p.substring(FileGateway.DIR.length + 1);
     }
@@ -784,18 +847,46 @@ class FileGateway {
   async saveNotebook(notebook: Notebook): Promise<void> {
     const adapter = this.app.vault.adapter;
     if (!(await adapter.exists(FileGateway.DIR))) await this.app.vault.createFolder(FileGateway.DIR);
-    const path = this.buildPath(`${notebook.name}.gnnote`);
+    const path = this.buildPath(`${notebook.name}.remi`);
     await adapter.write(path, JSON.stringify(notebook));
   }
 
   async loadNotebooks(): Promise<Notebook[]> {
     const adapter = this.app.vault.adapter;
     const dir = FileGateway.DIR;
+    const OLD_DIR = 'GoodNoteMax';
+
+    // ── Auto-migration: GoodNoteMax/ → RemiNote/ ──
+    try {
+      if (await adapter.exists(OLD_DIR)) {
+        console.log('[BOOT] Detected old GoodNoteMax/ directory — migrating to RemiNote/...');
+        const oldList = await adapter.list(OLD_DIR);
+        for (const f of oldList.files) {
+          const bareName = f.replace(/\\/g, '/').split('/').pop() || f;
+          // Also migrate .gnnote → .remi during folder move
+          const remiName = bareName.replace(/\.gnnote$/i, '.remi').replace(/\.gnote$/i, '.remi');
+          const destPath = `${dir}/${remiName}`;
+          try {
+            const content = await adapter.read(f);
+            await adapter.write(destPath, content);
+            await adapter.remove(f);
+            console.log('[MIGRATE] moved:', f, '→', destPath);
+          } catch (mfErr) {
+            console.warn('[MIGRATE] failed to migrate:', f, mfErr);
+          }
+        }
+        // Remove old empty folder
+        try { await adapter.remove(OLD_DIR); } catch (rmErr) { console.warn('[MIGRATE] could not remove old dir:', rmErr); }
+        console.log('[BOOT] Migration from GoodNoteMax/ complete.');
+      }
+    } catch (e) {
+      console.warn('[BOOT] Migration check failed:', e);
+    }
 
     try {
       if (!(await adapter.exists(dir))) {
         await this.app.vault.createFolder(dir);
-        console.log('[BOOT] GoodNoteMax folder created, no notebooks');
+        console.log('[BOOT] RemiNote folder created, no notebooks');
         return [];
       }
     } catch (e) {
@@ -812,11 +903,14 @@ class FileGateway {
       return [];
     }
 
-    const gnFiles = list.files.filter((f: string) => f.endsWith('.gnnote') || f.endsWith('.gnote'));
-    console.log('[BOOT] gnnote files found:', gnFiles.length);
+    // Support both .remi (new) and .gnnote/.gnote (old migrated) for backward compat
+    const remiFiles = list.files.filter((f: string) =>
+      f.endsWith('.remi') || f.endsWith('.gnnote') || f.endsWith('.gnote')
+    );
+    console.log('[BOOT] notebook files found:', remiFiles.length);
 
     const result: Notebook[] = [];
-    for (const rawName of gnFiles) {
+    for (const rawName of remiFiles) {
       const filePath = this.buildPath(rawName);
       try {
         const raw = await adapter.read(filePath);
@@ -827,14 +921,14 @@ class FileGateway {
         if (!nb.pages) nb.pages = [];
         result.push(nb);
 
-        // Auto-migrate to id-based filename
-        const correctPath = this.buildPath(`${nb.name}.gnnote`);
-        if (filePath !== correctPath) {
+        // Auto-migrate: .gnnote/.gnote → .remi
+        if (filePath.endsWith('.gnnote') || filePath.endsWith('.gnote')) {
+          const remiPath = filePath.replace(/\.gnnote$/, '.remi').replace(/\.gnote$/, '.remi');
           try {
-            await adapter.write(correctPath, JSON.stringify(nb));
-            if (filePath !== correctPath) await adapter.remove(filePath);
-            console.log('[BOOT] migrated:', filePath, '→', correctPath);
-          } catch (migErr) { console.warn('[BOOT] migration failed:', filePath, migErr); }
+            await adapter.write(remiPath, JSON.stringify(nb));
+            await adapter.remove(filePath);
+            console.log('[BOOT] ext-migrated:', filePath, '→', remiPath);
+          } catch (migErr) { console.warn('[BOOT] ext-migration failed:', filePath, migErr); }
         }
 
         console.log('[BOOT] parsed:', nb.name, '| pages:', nb.pages.length);
@@ -846,14 +940,14 @@ class FileGateway {
   }
 
   async deleteNotebook(notebook: Notebook): Promise<void> {
-    const p = this.buildPath(`${notebook.name}.gnnote`);
+    const p = this.buildPath(`${notebook.name}.remi`);
     try {
       if (await this.app.vault.adapter.exists(p)) await this.app.vault.adapter.remove(p);
     } catch (e) { console.warn('[FileGateway] delete failed:', p, e); }
   }
 
   async notebookFileExists(notebook: Notebook): Promise<boolean> {
-    try { return await this.app.vault.adapter.exists(this.buildPath(`${notebook.name}.gnnote`)); }
+    try { return await this.app.vault.adapter.exists(this.buildPath(`${notebook.name}.remi`)); }
     catch { return false; }
   }
 }
@@ -863,8 +957,8 @@ class FileGateway {
 // ============================================================
 
 class NotebookModal extends Modal {
-  plugin: GoodNoteMaxPlugin;
-  constructor(app: App, plugin: GoodNoteMaxPlugin) { super(app); this.plugin = plugin; }
+  plugin: RemiNotePlugin;
+  constructor(app: App, plugin: RemiNotePlugin) { super(app); this.plugin = plugin; }
   onOpen() {
     const { contentEl } = this; contentEl.empty();
     contentEl.createEl('h2', { text: 'Create Notebook' });
@@ -899,8 +993,8 @@ class NotebookModal extends Modal {
 // ============================================================
 
 class NotebookRenameModal extends Modal {
-  plugin: GoodNoteMaxPlugin; nbId: string; cur: string;
-  constructor(app: App, p: GoodNoteMaxPlugin, nbId: string, cur: string) { super(app); this.plugin = p; this.nbId = nbId; this.cur = cur; }
+  plugin: RemiNotePlugin; nbId: string; cur: string;
+  constructor(app: App, p: RemiNotePlugin, nbId: string, cur: string) { super(app); this.plugin = p; this.nbId = nbId; this.cur = cur; }
   onOpen() {
     const { contentEl } = this; contentEl.empty(); contentEl.createEl('h2', { text: 'Rename Notebook' });
     let v = this.cur;
@@ -919,8 +1013,8 @@ class NotebookRenameModal extends Modal {
 // ============================================================
 
 class RenameModal extends Modal {
-  plugin: GoodNoteMaxPlugin; nbId: string; pId: string; cur: string;
-  constructor(app: App, p: GoodNoteMaxPlugin, nbId: string, pId: string, cur: string) { super(app); this.plugin = p; this.nbId = nbId; this.pId = pId; this.cur = cur; }
+  plugin: RemiNotePlugin; nbId: string; pId: string; cur: string;
+  constructor(app: App, p: RemiNotePlugin, nbId: string, pId: string, cur: string) { super(app); this.plugin = p; this.nbId = nbId; this.pId = pId; this.cur = cur; }
   onOpen() {
     const { contentEl } = this; contentEl.empty(); contentEl.createEl('h2', { text: 'Rename Page' });
     let v = this.cur;
@@ -941,15 +1035,15 @@ class RenameModal extends Modal {
 // ============================================================
 
 class NotebookView extends ItemView {
-  plugin: GoodNoteMaxPlugin; listEl!: HTMLElement;
-  constructor(leaf: WorkspaceLeaf, plugin: GoodNoteMaxPlugin) { super(leaf); this.plugin = plugin; }
+  plugin: RemiNotePlugin; listEl!: HTMLElement;
+  constructor(leaf: WorkspaceLeaf, plugin: RemiNotePlugin) { super(leaf); this.plugin = plugin; }
   getViewType(): string { return NOTEBOOK_VIEW_TYPE; }
   getDisplayText(): string { return 'Notebooks'; }
   getIcon(): string { return 'pen-tool'; }
 
   async onOpen() {
-    const c = this.containerEl; c.empty(); c.addClass('goodnote-max-view');
-    const h = c.createEl('div', { cls: 'goodnote-header' });
+    const c = this.containerEl; c.empty(); c.addClass('reminote-view');
+    const h = c.createEl('div', { cls: 'reminote-header' });
     h.createEl('h4', { text: 'Notebooks' });
     h.createEl('button', { text: '+ Create' }).onclick = () => new NotebookModal(this.plugin.app, this.plugin).open();
     this.listEl = c.createEl('ul');
@@ -990,7 +1084,7 @@ class NotebookView extends ItemView {
 type PageViewMode = 'list' | 'thumbnail';
 
 class PageView extends ItemView {
-  plugin: GoodNoteMaxPlugin;
+  plugin: RemiNotePlugin;
   private headerEl!: HTMLElement;
   private listEl!: HTMLElement;
   private footerEl!: HTMLElement;
@@ -999,13 +1093,13 @@ class PageView extends ItemView {
   /** UI-only state — 不影响数据层，不传给 PageManager */
   private mode: PageViewMode = 'list';
 
-  constructor(leaf: WorkspaceLeaf, plugin: GoodNoteMaxPlugin) { super(leaf); this.plugin = plugin; }
+  constructor(leaf: WorkspaceLeaf, plugin: RemiNotePlugin) { super(leaf); this.plugin = plugin; }
   getViewType(): string { return PAGE_VIEW_TYPE; }
   getDisplayText(): string { return 'Pages'; }
   getIcon(): string { return 'files'; }
 
   async onOpen() {
-    const c = this.containerEl; c.empty(); c.addClass('goodnote-page-view');
+    const c = this.containerEl; c.empty(); c.addClass('reminote-page-view');
 
     // ── Header: Notebook name + dropdown toggle ──
     this.headerEl = c.createEl('div', { cls: 'gn-page-header' });
@@ -1312,7 +1406,7 @@ class PageView extends ItemView {
 type CanvasLayoutMode = 'main'; // future: 'split' | 'fullscreen' | 'floating'
 
 class CanvasLayoutManager {
-  constructor(private app: App, private plugin: GoodNoteMaxPlugin) {}
+  constructor(private app: App, private plugin: RemiNotePlugin) {}
 
   async mountCanvas(notebookId: string, pageId: string, _mode: CanvasLayoutMode = 'main'): Promise<CanvasView> {
     const { workspace } = this.app;
@@ -1340,7 +1434,7 @@ class CanvasLayoutManager {
 // ============================================================
 
 class PageManager {
-  constructor(private plugin: GoodNoteMaxPlugin) {}
+  constructor(private plugin: RemiNotePlugin) {}
 
   // ============ 内部辅助 ============
 
@@ -1585,6 +1679,7 @@ class CanvasPolicy {
   static getDefaults(): HandwritingParams {
     return {
       spacing: 3, smoothness: 0.5, strokeWidth: 2, cornerKeep: 0.3,
+      opacity: 1, color: '#1a1a1a', brushType: 'brush-pen',
       dynamicInk: { enabled: true, strength: 0.25, minWidth: 0.6, maxWidth: 1.8 },
     };
   }
@@ -1681,6 +1776,7 @@ class CanvasRuntimeEngine {
     this.strokes = safe;
     this.isDrawing = false;
     this.currentStroke = null;
+    this.clearHistory();
 
     return true;
   }
@@ -1693,24 +1789,27 @@ class CanvasRuntimeEngine {
     this.mode = mode;
   }
 
-  startStroke(pt: { x: number; y: number }, pointerId: number, setCapture: (id: number) => void) {
+  startStroke(pt: { x: number; y: number; pressure?: number }, pointerId: number, setCapture: (id: number) => void) {
     // Task 6: NaN guard — prevent corrupted data
     if (!Number.isFinite(pt.x) || !Number.isFinite(pt.y)) {
       console.warn('[ENGINE] startStroke blocked — non-finite coords', pt);
       return;
     }
     this.isDrawing = true;
-    const p0 = { x: pt.x, y: pt.y, t: performance.now(), speed: 0 };
+    const p0 = { x: pt.x, y: pt.y, t: performance.now(), speed: 0, pressure: (pt as { pressure?: number }).pressure ?? 0.5 };
     this.currentStroke = {
       id: genId(),
       points: [p0],
-      color: '#000000',
+      color: this.params.color ?? '#1a1a1a',
       width: this.params.strokeWidth,
       _penParams: {
         spacing: this.params.spacing,
         smoothness: this.params.smoothness,
         strokeWidth: this.params.strokeWidth,
         cornerKeep: this.params.cornerKeep,
+        opacity: this.params.opacity ?? 1,
+        color: this.params.color ?? '#1a1a1a',
+        brushType: this.params.brushType,
       },
       debug: { pointCount: 1, resampleCount: 0, droppedPoints: 0, avgSpeed: 0 },
       penState: { lastSpeed: 0, smoothedSpeed: 0, lastWidth: this.params.strokeWidth },
@@ -1768,12 +1867,11 @@ class CanvasRuntimeEngine {
     for (let i = 0; i < count; i++) {
       cx += dx;
       cy += dy;
-      const prev = points[points.length - 1];
       points.push({
-        x: prev.x * 0.3 + cx * 0.7,
-        y: prev.y * 0.3 + cy * 0.7,
+        x: cx,
+        y: cy,
         t: performance.now(),
-        speed: prev.speed ?? 0,
+        speed: 0,
       });
       // debug: 记录插值生成的新点
       if (this.currentStroke.debug) {
@@ -1816,9 +1914,10 @@ class CanvasRuntimeEngine {
     const stroke = this.currentStroke;
     if (stroke) {
       stroke.quality = this.analyzeStroke(stroke.points);
+      this._pushUndo(stroke); // Record for undo
     }
     this.currentStroke = null;
-    this.commit();
+    this.commitNow(); // 🟦 Force immediate flush — no 80ms delay
   }
 
   private analyzeStroke(points: { x: number; y: number }[]): StrokeQuality {
@@ -1930,9 +2029,61 @@ class CanvasRuntimeEngine {
   removeStroke(strokeId: string): boolean {
     const idx = this.strokes.findIndex(s => s.id === strokeId);
     if (idx === -1) return false;
-    this.strokes.splice(idx, 1);
+    const [removed] = this.strokes.splice(idx, 1);
+    this._pushUndo(removed); // Erased strokes also undoable
     return true;
   }
+
+  // ============================================================
+  //  Undo / Redo
+  // ============================================================
+
+  private _undoStack: Stroke[] = [];
+  private _redoStack: Stroke[] = [];
+
+  /** External callback fired when undo/redo state changes. */
+  onUndoChange: (() => void) | null = null;
+
+  /** Record a stroke for undo (called on endStroke and erase). */
+  private _pushUndo(stroke: Stroke): void {
+    this._undoStack.push(stroke);
+    this._redoStack = []; // New action invalidates redo
+    this.onUndoChange?.();
+  }
+
+  /** Undo last action. Returns the affected stroke or null. */
+  undo(): Stroke | null {
+    if (this._undoStack.length === 0) return null;
+    const stroke = this._undoStack.pop()!;
+    // Remove from strokes (if still present)
+    const idx = this.strokes.findIndex(s => s.id === stroke.id);
+    if (idx !== -1) {
+      this.strokes.splice(idx, 1);
+    }
+    this._redoStack.push(stroke);
+    this.onUndoChange?.();
+    return stroke;
+  }
+
+  /** Redo last undone action. Returns the restored stroke or null. */
+  redo(): Stroke | null {
+    if (this._redoStack.length === 0) return null;
+    const stroke = this._redoStack.pop()!;
+    this.strokes.push(stroke);
+    this._undoStack.push(stroke);
+    this.onUndoChange?.();
+    return stroke;
+  }
+
+  /** Clear undo/redo history (e.g. on page switch). */
+  clearHistory(): void {
+    this._undoStack = [];
+    this._redoStack = [];
+    this.onUndoChange?.();
+  }
+
+  get canUndo(): boolean { return this._undoStack.length > 0; }
+  get canRedo(): boolean { return this._redoStack.length > 0; }
 
   /** Add a fully-constructed stroke (for external injection, e.g. paste / import). */
   addStroke(stroke: Stroke): void {
@@ -2165,11 +2316,20 @@ class ReplayController {
 interface RenderableStroke {
   id: string;
   path2D: Path2D;
-  style: { color: string; lineWidth: number; lineCap: CanvasLineCap; lineJoin: CanvasLineJoin };
+  style: { color: string; lineWidth: number; lineCap: CanvasLineCap; lineJoin: CanvasLineJoin; opacity: number; _widths?: number[]; _brushType?: string };
   /** The stroke points reference this was built from — compared by reference to detect changes. */
   _sourcePoints: { x: number; y: number }[];
   /** For replay: total point count in source stroke */
   _totalPoints: number;
+  /** Glyph data for direct font character rendering */
+  _glyph?: {
+    char: string;
+    fontFamily: string;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  };
 }
 
 // ============================================================
@@ -2220,25 +2380,35 @@ class StrokeDirtyTracker {
 
 class StrokeRenderCache {
   private cache = new Map<string, Path2D>();
+  /** Tracks how many points the cached Path2D was built from (for incremental rebuild). */
+  private _smoothCounts = new Map<string, number>();
 
   /** Get cached Path2D, or undefined if not built yet. */
   get(strokeId: string): Path2D | undefined {
     return this.cache.get(strokeId);
   }
 
-  /** Store a Path2D in cache. */
-  set(strokeId: string, path2D: Path2D): void {
+  /** Store a Path2D in cache with optional point count for incremental rebuild. */
+  set(strokeId: string, path2D: Path2D, pointCount?: number): void {
     this.cache.set(strokeId, path2D);
+    if (pointCount !== undefined) this._smoothCounts.set(strokeId, pointCount);
+  }
+
+  /** Get the number of points the cached Path2D was built from. */
+  getSmoothCount(strokeId: string): number {
+    return this._smoothCounts.get(strokeId) ?? 0;
   }
 
   /** Invalidate (remove) a stroke's cached Path2D. */
   invalidate(strokeId: string): void {
     this.cache.delete(strokeId);
+    this._smoothCounts.delete(strokeId);
   }
 
   /** Clear all cached Path2Ds. */
   clear(): void {
     this.cache.clear();
+    this._smoothCounts.clear();
   }
 
   /** Number of cached entries. */
@@ -2366,28 +2536,34 @@ class RenderQueue {
 
       if (replayCtrl?.isActive(s.id)) {
         const cursorIdx = replayCtrl.cursorIndex;
-        const pts = s.points.slice(0, cursorIdx);
+        let pts = s.points.slice(0, cursorIdx);
         if (pts.length < 2) continue;
+        pts = beautifyStroke(pts, beautifyConfig); // Always smooth
         const path2D = buildPath2D(pts, s._penParams || params);
-        cache.set(s.id, path2D);
+        cache.set(s.id, path2D, pts.length);
         newRenderables.push({
           id: s.id, path2D,
           style: buildStyle(s, s._penParams || params),
           _sourcePoints: s.points, _totalPoints: s.points.length,
+          _glyph: s._glyph,
         });
         continue;
       }
 
-      // Cache hit check
+      // Cache hit check — use incremental rebuild for in-progress strokes
       let path2D = cache.get(s.id);
-      if (!path2D) {
-        path2D = buildPath2D(s.points, s._penParams || params);
-        cache.set(s.id, path2D);
+      const prevCount = cache.getSmoothCount(s.id);
+      if (!path2D || (prevCount > 0 && prevCount !== s.points.length)) {
+        const freezeIdx = !path2D ? 0 : prevCount;
+        const pts = beautifyStroke(s.points, beautifyConfig); // Always smooth
+        path2D = buildPath2D(pts, s._penParams || params, freezeIdx);
+        cache.set(s.id, path2D, s.points.length);
       }
       newRenderables.push({
         id: s.id, path2D,
         style: buildStyle(s, s._penParams || params),
         _sourcePoints: s.points, _totalPoints: s.points.length,
+        _glyph: s._glyph,
       });
     }
 
@@ -2432,10 +2608,13 @@ class RenderQueue {
       const s = strokes[idx];
       if (!s?.points || s.points.length === 0) continue;
 
-      // Rebuild Path2D and update cache
+      // 🟢 Incremental rebuild: only smooth/build from last cached point count
       const pp = s._penParams || params;
-      const path2D = buildPath2D(s.points, pp);
-      cache.set(s.id, path2D);
+      const prevCount = cache.getSmoothCount(s.id);
+      const freezeIdx = prevCount > 0 ? prevCount : 0;
+      const pts = beautifyStroke(s.points, beautifyConfig); // Always smooth
+      const path2D = buildPath2D(pts, pp, freezeIdx);
+      cache.set(s.id, path2D, s.points.length);
 
       // Update renderable in-place or create new
       while (this.renderables.length <= idx) {
@@ -2445,6 +2624,7 @@ class RenderQueue {
         id: s.id, path2D,
         style: buildStyle(s, pp),
         _sourcePoints: s.points, _totalPoints: s.points.length,
+        _glyph: s._glyph,
       };
     }
   }
@@ -2479,32 +2659,119 @@ class RenderQueue {
 //  Pure functions for Path2D building & style creation
 // ============================================================
 
+/** ⭐ Smoothing kernel — weighted 5-point smoothing with curvature awareness. */
+function smoothStroke(
+  points: { x: number; y: number }[],
+  freezeIdx: number = 0,
+): { x: number; y: number }[] {
+  if (points.length < 3) return points;
+  const smoothed: { x: number; y: number }[] = points.slice(0, Math.max(0, freezeIdx));
+  const startI = Math.max(freezeIdx, 0);
+
+  for (let i = startI; i < points.length; i++) {
+    // Center-weighted smoother: current point gets 0.5 weight, neighbors share rest
+    if (i === 0 || i === points.length - 1) {
+      smoothed.push({ x: points[i].x, y: points[i].y });
+      continue;
+    }
+    const p0 = points[i - 1];
+    const p1 = points[i];
+    const p2 = points[i + 1];
+    // Weighted blend: center point dominates (0.5), edges contribute 0.25 each
+    smoothed.push({
+      x: p0.x * 0.25 + p1.x * 0.5 + p2.x * 0.25,
+      y: p0.y * 0.25 + p1.y * 0.5 + p2.y * 0.25,
+    });
+  }
+  return smoothed;
+}
+
+// ============================================================
+//  HSL ↔ RGB Color Helpers
+// ============================================================
+
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  let r: number, g: number, b: number;
+  if (s === 0) {
+    r = g = b = l;
+  } else {
+    const hue2rgb = (p: number, q: number, t: number) => {
+      if (t < 0) t += 1;
+      if (t > 1) t -= 1;
+      if (t < 1 / 6) return p + (q - p) * 6 * t;
+      if (t < 1 / 2) return q;
+      if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+      return p;
+    };
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    r = hue2rgb(p, q, h + 1 / 3);
+    g = hue2rgb(p, q, h);
+    b = hue2rgb(p, q, h - 1 / 3);
+  }
+  return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+}
+
+function rgbToHsl(r: number, g: number, b: number): { h: number; s: number; l: number } {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let h = 0, s = 0;
+  const l = (max + min) / 2;
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+    else if (max === g) h = ((b - r) / d + 2) / 6;
+    else h = ((r - g) / d + 4) / 6;
+  }
+  return { h: h * 360, s, l };
+}
+
+function hexToHsl(hex: string): { h: number; s: number; l: number } {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return rgbToHsl(r, g, b);
+}
+
+function hslToHex(h: number, s: number, l: number): string {
+  const [r, g, b] = hslToRgb(h / 360, s, l);
+  return '#' + [r, g, b].map(c => c.toString(16).padStart(2, '0')).join('');
+}
+
+// ============================================================
+
 function buildPath2D(
   points: { x: number; y: number }[],
   p: { spacing: number; smoothness: number; strokeWidth: number; cornerKeep: number },
+  freezeIdx: number = 0,
 ): Path2D {
+  // 🟦 Incremental smoothing: freezeIdx points are already smoothed from previous cache
+  const pts = smoothStroke(points, freezeIdx);
   const path = new Path2D();
 
-  if (points.length === 1) {
-    path.moveTo(points[0].x, points[0].y);
-    path.arc(points[0].x, points[0].y, 1, 0, Math.PI * 2);
+  if (pts.length === 1) {
+    path.moveTo(pts[0].x, pts[0].y);
+    path.arc(pts[0].x, pts[0].y, 1, 0, Math.PI * 2);
     return path;
   }
 
-  if (points.length === 2) {
-    path.moveTo(points[0].x, points[0].y);
-    path.lineTo(points[1].x, points[1].y);
+  if (pts.length === 2) {
+    path.moveTo(pts[0].x, pts[0].y);
+    path.lineTo(pts[1].x, pts[1].y);
     return path;
   }
 
   const thresholdAngle = p.cornerKeep * Math.PI;
-  path.moveTo(points[0].x, points[0].y);
+  // Always build full path from point 0 — freezeIdx only affects smoothStroke
+  // (freezes early smoothed points from recalculation, not from Path2D inclusion)
+  path.moveTo(pts[0].x, pts[0].y);
 
-  for (let i = 1; i < points.length - 1; i++) {
-    const v1x = points[i].x - points[i - 1].x;
-    const v1y = points[i].y - points[i - 1].y;
-    const v2x = points[i + 1].x - points[i].x;
-    const v2y = points[i + 1].y - points[i].y;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const v1x = pts[i].x - pts[i - 1].x;
+    const v1y = pts[i].y - pts[i - 1].y;
+    const v2x = pts[i + 1].x - pts[i].x;
+    const v2y = pts[i + 1].y - pts[i].y;
     const dot = v1x * v2x + v1y * v2y;
     const m1 = Math.hypot(v1x, v1y);
     const m2 = Math.hypot(v2x, v2y);
@@ -2512,84 +2779,114 @@ function buildPath2D(
     const angle = Math.acos(Math.max(-1, Math.min(1, cosA)));
 
     if (angle > thresholdAngle) {
-      path.lineTo(points[i].x, points[i].y);
+      path.lineTo(pts[i].x, pts[i].y);
       continue;
     }
 
     const t = p.smoothness;
     path.quadraticCurveTo(
-      points[i].x, points[i].y,
-      points[i].x + (points[i + 1].x - points[i].x) * t,
-      points[i].y + (points[i + 1].y - points[i].y) * t,
+      pts[i].x, pts[i].y,
+      pts[i].x + (pts[i + 1].x - pts[i].x) * t,
+      pts[i].y + (pts[i + 1].y - pts[i].y) * t,
     );
   }
 
-  path.lineTo(points[points.length - 1].x, points[points.length - 1].y);
+  path.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
   return path;
 }
 
 function buildStyle(
   s: Stroke,
-  p: { spacing: number; smoothness: number; strokeWidth: number; cornerKeep: number },
-): { color: string; lineWidth: number; lineCap: CanvasLineCap; lineJoin: CanvasLineJoin } {
+  p: { spacing: number; smoothness: number; strokeWidth: number; cornerKeep: number; opacity?: number; color?: string; brushType?: string },
+): { color: string; lineWidth: number; lineCap: CanvasLineCap; lineJoin: CanvasLineJoin; opacity: number; _widths?: number[]; _brushType?: string } {
+  const baseW = CanvasPolicy.clampStrokeWidth(p.strokeWidth);
+  const widths = computeStrokeWidths(s.points, baseW);
   return {
-    color: s.color,
-    lineWidth: CanvasPolicy.clampStrokeWidth(p.strokeWidth),
+    color: p.color ?? s.color,
+    lineWidth: baseW,
     lineCap: 'round' as CanvasLineCap,
     lineJoin: 'round' as CanvasLineJoin,
+    opacity: p.opacity ?? 1,
+    _widths: widths,
+    _brushType: p.brushType ?? 'brush-pen',
   };
 }
 
+/** ⭐ Compute per-point widths: smoothstep taper + EMA-filtered pressure + sharp tips. */
+function computeStrokeWidths(
+  points: { x: number; y: number; t?: number; speed?: number; pressure?: number }[],
+  baseW: number,
+): number[] {
+  const n = points.length;
+  if (n < 2) return new Array(n).fill(baseW);
+
+  const w: number[] = new Array(n);
+  const hasPressure = points.some(p => p.pressure !== undefined && p.pressure > 0 && p.pressure < 1);
+
+  // ⭐ Pressure low-pass filter: EMA 0.85prev + 0.15new
+  // Prevents Apple Pencil pressure jitter from causing width flicker
+  let prevFilteredP = points[0]?.pressure ?? 0.5;
+  const filteredPs: number[] = [prevFilteredP];
+
+  if (hasPressure) {
+    for (let i = 1; i < n; i++) {
+      const rawP = points[i].pressure ?? 0.5;
+      const smoothed = prevFilteredP * 0.85 + rawP * 0.15;
+      filteredPs.push(smoothed);
+      prevFilteredP = smoothed;
+    }
+  }
+
+  for (let i = 0; i < n; i++) {
+    let bw = baseW;
+
+    // ⭐ Smoothstep taper: allows tips to go much thinner than before
+    if (n > 6) {
+      const fadeLen = Math.min(8, Math.floor(n * 0.08)); // first/last 8% or 8 pts
+      const endDist = Math.min(i, n - 1 - i);
+      if (endDist < fadeLen) {
+        const t = endDist / Math.max(1, fadeLen - 1); // 0 at tip → 1 at body
+        const fade = t * t * (3 - 2 * t); // smoothstep
+        bw *= 0.15 + 0.85 * fade; // min 15% at tip (sharp!), full at body
+      }
+    }
+
+    if (hasPressure) {
+      // Use EMA-filtered pressure (not raw)
+      const p = filteredPs[i];
+      // PS-style pressure range: 0.35~1.0 (保底0.35，防止压力抖动导致毛笔纤维感)
+      bw *= 0.35 + p * 0.65;
+    }
+
+    w[i] = Math.max(0.08, Math.min(bw, baseW * 1.8));
+  }
+
+  return w;
+}
+
 // ============================================================
-//  Renderer — 无状态渲染器，支持 dirty region clip
+//  Renderer — 无状态渲染器，每帧全量清除重绘
 // ============================================================
 
 class Renderer {
-  /**
-   * Draw the render queue to canvas.
-   * If queue has a dirtyRegion, uses ctx.clip() for partial redraw.
-   * Otherwise performs full canvas redraw.
-   */
+  /** Draw the render queue to canvas. Always full clear+redraw to prevent double-stroke artifacts. */
   draw(
     ctx: CanvasRenderingContext2D,
     canvas: HTMLCanvasElement,
     queue: RenderQueue,
     viewport: Viewport,
   ): void {
-    const dirty = queue.getDirtyRegion();
     // 🔒 Use FROZEN camera from queue, NOT live viewport.camera
     const cam = queue.camera;
     const dpr = viewport.dpr;
 
-    if (dirty && dirty.w > 0 && dirty.h > 0) {
-      // ── Partial redraw: clip to dirty region in device space ──
-      ctx.save();
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-
-      // Convert world-space dirty region to device space using frozen camera
-      const dx = (dirty.x * cam.zoom + cam.x) * dpr;
-      const dy = (dirty.y * cam.zoom + cam.y) * dpr;
-      const dw = dirty.w * cam.zoom * dpr;
-      const dh = dirty.h * cam.zoom * dpr;
-
-      // Expand slightly to account for stroke width and anti-aliasing
-      const pad = 4;
-      ctx.beginPath();
-      ctx.rect(dx - pad, dy - pad, dw + pad * 2, dh + pad * 2);
-      ctx.clip();
-
-      // Clear + fill background in clipped region only
-      ctx.clearRect(dx - pad, dy - pad, dw + pad * 2, dh + pad * 2);
-      ctx.fillStyle = queue.backgroundColor;
-      ctx.fillRect(dx - pad, dy - pad, dw + pad * 2, dh + pad * 2);
-      ctx.restore();
-    } else {
-      // ── Full redraw ──
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = queue.backgroundColor;
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-    }
+    // ── Always full redraw: partial clear causes old strokes to render
+    //     on top of themselves (uncleared areas) → double anti-aliasing → blur.
+    ctx.imageSmoothingEnabled = false;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = queue.backgroundColor;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
 
     // 🔒 Apply camera transform using FROZEN snapshot, not live camera
     ctx.setTransform(
@@ -2602,13 +2899,114 @@ class Renderer {
     // Batch draw all renderables
     for (const r of queue.renderables) {
       if (!r) continue;
+
+      // 🎯 Glyph rendering: draw font character directly (not stroke path)
       ctx.save();
       ctx.strokeStyle = r.style.color;
-      ctx.lineWidth = r.style.lineWidth;
       ctx.lineCap = r.style.lineCap;
       ctx.lineJoin = r.style.lineJoin;
-      ctx.stroke(r.path2D);
+
+      const pts = r._sourcePoints;
+      const ws = r.style._widths;
+      const color = r.style.color;
+      const baseAlpha = r.style.opacity ?? 1;
+      const brushType = r.style._brushType ?? 'brush-pen';
+
+      if (brushType === 'ps-default' && pts && pts.length >= 2 && ws && ws.length >= 2) {
+        // ⭐ PS Default — 轻量 per-segment quad fill (变宽 mesh)
+        // 每段 p[i]→p[i+1]: 宽度 ws[i]→ws[i+1]，填充四边形
+        // 不调用 buildStrokeGeometry，不 multiply，不 0.85 alpha
+        ctx.fillStyle = color;
+        ctx.globalAlpha = baseAlpha;
+
+        ctx.beginPath();
+        for (let i = 0; i < pts.length - 1; i++) {
+          const p0 = pts[i], p1 = pts[i + 1];
+          const hw0 = ws[i] / 2, hw1 = ws[i + 1] / 2;
+          const dx = p1.x - p0.x, dy = p1.y - p0.y;
+          const len = Math.hypot(dx, dy) || 1;
+          const nx = -dy / len, ny = dx / len; // left normal
+
+          // Quad: left0 → right0 → right1 → left1 → close
+          ctx.moveTo(p0.x + nx * hw0, p0.y + ny * hw0);
+          ctx.lineTo(p0.x - nx * hw0, p0.y - ny * hw0);
+          ctx.lineTo(p1.x - nx * hw1, p1.y - ny * hw1);
+          ctx.lineTo(p1.x + nx * hw1, p1.y + ny * hw1);
+          ctx.closePath();
+        }
+        ctx.fill();
+
+        // Round caps at ends
+        if (pts.length > 0 && ws.length > 0) {
+          const first = pts[0], last = pts[pts.length - 1];
+          const r0 = ws[0] / 2, r1 = ws[ws.length - 1] / 2;
+          if (r0 > 0.5) {
+            ctx.beginPath(); ctx.arc(first.x, first.y, r0, 0, Math.PI * 2); ctx.fill();
+          }
+          if (r1 > 0.5 && pts.length > 1) {
+            ctx.beginPath(); ctx.arc(last.x, last.y, r1, 0, Math.PI * 2); ctx.fill();
+          }
+        }
+
+      } else if (brushType === 'brush-pen' && pts && pts.length >= 1 && ws && pts.length === ws.length) {
+        // ⭐ Brush Pen — 三角形 mesh 管线 (墨水感，两头尖，叠色)
+        const point2ds: Point2D[] = pts.map(p => ({
+          x: p.x, y: p.y,
+          pressure: 0.5,
+          speed: 0,
+        }));
+        const geom = buildStrokeGeometry(point2ds, {
+          width: r.style.lineWidth,
+          smoothing: 0.5,
+          taper: 0.7,
+          minWidth: 0.02,
+          maxWidth: 1.4,
+          capSegments: 8,
+          edgeBlur: 0.3,
+          startFadePct: 0.06,
+          endFadePct: 0.08,
+        });
+        drawGeometryToCanvas2D(ctx, geom, color, r.style.lineWidth, 0.3);
+
+      } else {
+        // Fallback: uniform width path stroke
+        ctx.globalAlpha = baseAlpha;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = r.style.lineWidth;
+        ctx.stroke(r.path2D);
+      }
+
       ctx.restore();
+    }
+
+    // 🎯 Render all glyphs — auto-clean orphaned entries
+    const glyphs = (window as any).__REMINOTE_GLYPHS__ as Array<{ char: string; fontFamily: string; x: number; y: number; w: number; h: number; color: string; opacity: number; strokeIds: string[] }> | null;
+    if (glyphs && glyphs.length > 0) {
+      const engStrokes = (window as any).__REMINOTE_ENGINE_STROKES__ as Array<{ id: string }> | undefined;
+      const liveIds = engStrokes ? new Set(engStrokes.map((s: any) => s.id)) : null;
+      
+      // Auto-clean: if NO strokes exist at all, clear all glyphs (page switch/trash)
+      if (!engStrokes || engStrokes.length === 0) {
+        (window as any).__REMINOTE_GLYPHS__ = [];
+      } else {
+        // Remove glyphs whose strokes are all gone
+        const valid = glyphs.filter(g => g.strokeIds?.some(id => liveIds?.has(id)));
+        if (valid.length !== glyphs.length) {
+          (window as any).__REMINOTE_GLYPHS__ = valid;
+        }
+        for (const g of valid) {
+          ctx.save();
+          ctx.fillStyle = g.color || '#1a1a1a';
+          ctx.globalAlpha = g.opacity ?? 1;
+          const cx = g.x + g.w / 2;
+          const cy = g.y + g.h / 2;
+          ctx.font = `${g.h * 0.92}px ${g.fontFamily}`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(g.char, cx, cy);
+          ctx.restore();
+        }
+      }
     }
   }
 }
@@ -2720,16 +3118,19 @@ class PointerPipeline {
       if (!session.isReady) return;
       const snapshot = this.inputCtrl.capture(ev, session);
       session.toolManager.getActive().onPointerDown(snapshot, session);
+      session.markDirty();
     };
     this._onPM = (ev) => {
       if (!session.isReady) return;
       const snapshot = this.inputCtrl.capture(ev, session);
       session.toolManager.getActive().onPointerMove(snapshot, session);
+      session.markDirty();
     };
     this._onPU = (ev) => {
       if (!session.isReady) return;
       const snapshot = this.inputCtrl.capture(ev, session);
       session.toolManager.getActive().onPointerUp(snapshot, session);
+      session.markDirty();
     };
     this._onWH = (ev) => {
       if (!session.isReady) return;
@@ -2741,19 +3142,20 @@ class PointerPipeline {
       session.syncViewState();
       session.markCameraDirty();
     };
-    el.addEventListener('pointerdown', this._onPD);
-    el.addEventListener('pointermove', this._onPM);
-    el.addEventListener('pointerup', this._onPU);
-    el.addEventListener('wheel', this._onWH, { passive: false });
+    // 🟦 Capture phase — events never reach Obsidian listeners
+    el.addEventListener('pointerdown', this._onPD, { capture: true });
+    el.addEventListener('pointermove', this._onPM, { capture: true });
+    el.addEventListener('pointerup', this._onPU, { capture: true });
+    el.addEventListener('wheel', this._onWH, { capture: true, passive: false });
   }
 
   destroy(): void {
     const el = this.session?.canvasEl;
     if (!el) return;
-    el.removeEventListener('pointerdown', this._onPD);
-    el.removeEventListener('pointermove', this._onPM);
-    el.removeEventListener('pointerup', this._onPU);
-    el.removeEventListener('wheel', this._onWH);
+    el.removeEventListener('pointerdown', this._onPD, { capture: true });
+    el.removeEventListener('pointermove', this._onPM, { capture: true });
+    el.removeEventListener('pointerup', this._onPU, { capture: true });
+    el.removeEventListener('wheel', this._onWH, { capture: true });
   }
 }
 
@@ -2850,7 +3252,7 @@ syncViewState(): void {
   constructor(
     public notebookId: string,
     public pageId: string,
-    private plugin: GoodNoteMaxPlugin,
+    private plugin: RemiNotePlugin,
     parentEl: HTMLElement
   ) {
     this.engine = plugin.createEngine();
@@ -2875,8 +3277,8 @@ syncViewState(): void {
       finally { plugin.isInternalWrite = false; }
     });
 
-    const wrapper = parentEl.createEl('div', { cls: 'goodnote-canvas-wrapper' });
-    this.canvasEl = wrapper.createEl('canvas', { cls: 'goodnote-canvas' });
+    const wrapper = parentEl.createEl('div', { cls: 'reminote-canvas-wrapper' });
+    this.canvasEl = wrapper.createEl('canvas', { cls: 'reminote-canvas' });
     this.ctx = this.canvasEl.getContext('2d')!;
 
     this._onResize = () => this.applySize();
@@ -2884,9 +3286,10 @@ syncViewState(): void {
     window.addEventListener('resize', this._onResize);
     this.pointerPipeline = new PointerPipeline(this);
 
-    // ── Render Pipeline: wire scheduler → unified tick (single RAF for whole system) ──
+    // ── Render Pipeline: scheduler wired but NOT auto-started ──
+    // 🟥 RuntimeOrchestrator owns the single RAF loop and calls orchestratorTick()
     this.renderScheduler.onFrame = () => this._unifiedTick();
-    this.renderScheduler.start();
+    // this.renderScheduler.start();  // DISABLED — orchestrator drives frames
 
     this.syncViewState(); // initial sync after construction
   }
@@ -2947,15 +3350,20 @@ syncViewState(): void {
     window.requestAnimationFrame(() => {
       if (!this.alive) return;
       const rect = this.canvasEl.getBoundingClientRect();
-      const w = Math.round(rect.width), h = Math.round(rect.height);
+      // 🟢 Use exact CSS pixels for both device buffer AND CSS size.
+      // Rounding CSS size independently creates ratio ≠ dpr → browser scaling blur.
+      const cssW = rect.width, cssH = rect.height;
+      const w = Math.round(cssW), h = Math.round(cssH);
       if (w < 50 || h < 50) return;
       if (w === this.viewport.cssW && h === this.viewport.cssH && this.viewport.cssW > 0) return;
       const dpr = window.devicePixelRatio || 1;
-      this.canvasEl.width = Math.round(w * dpr);
-      this.canvasEl.height = Math.round(h * dpr);
-      this.canvasEl.style.setProperty('--canvas-css-w', w + 'px');
-      this.canvasEl.style.setProperty('--canvas-css-h', h + 'px');
-      this.viewport.update(w, h, dpr);
+      this.canvasEl.width = Math.round(cssW * dpr);
+      this.canvasEl.height = Math.round(cssH * dpr);
+      this.canvasEl.style.setProperty('--canvas-css-w', cssW + 'px');
+      this.canvasEl.style.setProperty('--canvas-css-h', cssH + 'px');
+      this.viewport.update(cssW, cssH, dpr);
+      // 🟦 Bind canvas element for real-time hit testing
+      bindCanvas(this.canvasEl);
     });
   }
 
@@ -3075,15 +3483,6 @@ updateToolSettings(id: string, patch: Record<string, unknown>): boolean {
     if (!ctx || !canvas || !engine) return;
 
     this._frameCount++;
-    if (this._frameCount % 60 === 0) {
-      console.log('[RENDER CHECK]', {
-        cssW: this.viewport.cssW, cssH: this.viewport.cssH,
-        bufW: canvas.width, bufH: canvas.height,
-        strokeCount: engine.strokes.length,
-        cacheSize: this.strokeCache.size,
-        dirtyCount: this.dirtyTracker.hasDirty ? '(has dirty)' : '(clean)',
-      });
-    }
 
     // ① Sync camera snapshot into queue
     const c = this.viewport.camera;
@@ -3132,6 +3531,9 @@ updateToolSettings(id: string, patch: Record<string, unknown>): boolean {
   private _unifiedTick(): void {
     if (!this.alive) return;
 
+    // ⓪ Dual-Channel smoothing: advance EMA toward raw coords (once per frame)
+    tickSmoothing();
+
     // ① Inertia physics tick (if active)
     if (this.viewport.inertia.active) {
       const stillActive = this.viewport.inertia.tick();
@@ -3153,6 +3555,21 @@ updateToolSettings(id: string, patch: Record<string, unknown>): boolean {
 
     // ③ Render frame (always — other subsystems may have triggered markDirty)
     this.renderFrame();
+  }
+
+  /**
+   * 🟥 Public tick entry — called by RuntimeOrchestrator only.
+   * This is the sole frame advancement entry point for CanvasSession.
+   * No other module may call _unifiedTick() or renderFrame() directly.
+   */
+  orchestratorTick(): void {
+    this._unifiedTick();
+  }
+
+  /** 🟦 Mark dirty only — render happens in next RAF tick. No synchronous render. */
+  renderNow(): void {
+    this.assertAlive();
+    this.markDirty();
   }
 }
 
@@ -3196,7 +3613,7 @@ function createDefaultToolbarState(): ToolbarState {
 // ============================================================
 
 class CanvasView extends ItemView {
-  plugin: GoodNoteMaxPlugin;
+  plugin: RemiNotePlugin;
   session: CanvasSession | null = null;
 
   // UI layout
@@ -3204,6 +3621,7 @@ class CanvasView extends ItemView {
   private canvasAreaEl!: HTMLElement;
   private drawerEl!: HTMLElement;
   private isDrawerOpen = false;
+  private _drawerMode: 'tool' | 'beautify' = 'tool';
 
   // Floating toolbar — single state source
   private ts: ToolbarState = createDefaultToolbarState();
@@ -3214,7 +3632,7 @@ class CanvasView extends ItemView {
   // ── Cursor System v4 — unified CursorRenderer, PS-level brush preview ──
   private cursorRenderer!: CursorRenderer;
 
-  constructor(leaf: WorkspaceLeaf, plugin: GoodNoteMaxPlugin) { super(leaf); this.plugin = plugin; }
+  constructor(leaf: WorkspaceLeaf, plugin: RemiNotePlugin) { super(leaf); this.plugin = plugin; }
   getViewType(): string { return CANVAS_VIEW_TYPE; }
   getDisplayText(): string { return 'Canvas'; }
   getIcon(): string { return 'pen-tool'; }
@@ -3256,6 +3674,11 @@ class CanvasView extends ItemView {
 
     this.session = new CanvasSession(notebookId, pageId, this.plugin, this.canvasAreaEl);
     CanvasSessionRegistry.getInstance().register(this.session);
+    // Wire undo button state to engine changes
+    if (this.session.engine) {
+      this.session.engine.onUndoChange = () => this._syncUndoBar?.();
+    }
+    // (redraw orchestrator uses session directly via onStrokeEnd)
 
     // 强制单 canvas 断言 — 如果失败立即 destroy + 重建
     const ownerDoc = this.containerEl.ownerDocument;
@@ -3312,16 +3735,25 @@ class CanvasView extends ItemView {
       this._resizeObserver.disconnect();
       this._resizeObserver = null;
     }
+    // 🟥 Dashboard lifecycle managed by RuntimeOrchestrator — no direct unmount
+    // (was: this.plugin._dashboard?.unmount();)
     this.destroySession();
   }
 
   async onOpen() {
-    const c = this.containerEl; c.empty(); c.addClass("goodnote-canvas-view");
-    this.layoutEl = c.createEl("div", { cls: "goodnote-canvas-layout" });
-    this.canvasAreaEl = c.createEl("div", { cls: "goodnote-canvas-area" });
-    this.drawerEl = this.layoutEl.createEl("div", { cls: "goodnote-canvas-drawer" });
+    const c = this.containerEl; c.empty(); c.addClass("reminote-canvas-view");
+    this.layoutEl = c.createEl("div", { cls: "reminote-canvas-layout" });
+    // 🟦 Interaction shield — blocks Obsidian UI from hit-testing canvas area
+    this.layoutEl.createEl("div", { cls: "reminote-interaction-shield" });
+    this.canvasAreaEl = c.createEl("div", { cls: "reminote-canvas-area" });
+    this.drawerEl = this.layoutEl.createEl("div", { cls: "reminote-canvas-drawer" });
     this.buildDrawer(this.drawerEl);
     this.buildFloatingToolbar(this.layoutEl);
+    this.buildUndoBar(this.layoutEl);
+    // 🟦 Single UI Owner: CanvasUIController handles mount
+    if (this.plugin._uiController && this.layoutEl) {
+      this.plugin._uiController.mount(this.layoutEl);
+    }
 
     // ── ResizeObserver: cache viewport, never use getBoundingClientRect in hot paths ──
     let _roTimer: number | null = null;
@@ -3335,6 +3767,9 @@ class CanvasView extends ItemView {
         if (Math.abs(r.width - this.ts.viewportW) < 2 && Math.abs(r.height - this.ts.viewportH) < 2) return;
         this.ts.viewportW = r.width;
         this.ts.viewportH = r.height;
+        // 🟥 CRITICAL: Resize canvas device buffer to match CSS size
+        // Without this, collapsing sidebar stretches canvas without updating buffer → lines distort
+        this.session?.requestResize();
         // Re-apply state on resize (clamp + re-dock if needed)
         this.applyToolbarState();
       }, 150); // Wait for drawer transition (300ms) to settle
@@ -3406,13 +3841,15 @@ class CanvasView extends ItemView {
     this.ts.toolbarH = this.toolbarEl.offsetHeight;
   }
 
-  /** Initial position: bottom-left corner (12, viewportH - toolbarH - 12) */
+  /** Initial position: top-left corner — smartSnap will dock to left edge as vertical sidebar */
   private initToolbarPosition(): void {
     this.ts.dock = 'free';
     this.ts.x = 12;
-    this.ts.y = Math.max(0, this.ts.viewportH - this.ts.toolbarH - 12);
+    this.ts.y = 12;
     this.clearDockClasses();
     this.applyToolbarState();
+    // Trigger snap to dock left on first load
+    this.smartSnap();
   }
 
   private clearDockClasses(): void {
@@ -3428,7 +3865,7 @@ class CanvasView extends ItemView {
   // ============================================================
 
   private buildFloatingToolbar(parent: HTMLElement) {
-    this.toolbarEl = parent.createEl("div", { cls: "goodnote-floating-toolbar" });
+    this.toolbarEl = parent.createEl("div", { cls: "reminote-floating-toolbar" });
 
     const toolLabels: Record<string, string> = { pen: "钢笔", eraser: "橡皮", hand: "手掌" };
     for (const t of [{ k: "pen" as const, l: "\u2712\uFE0F" }, { k: "eraser" as const, l: "\uD83E\uDDF9" }, { k: "hand" as const, l: "\u270B" }]) {
@@ -3440,12 +3877,30 @@ class CanvasView extends ItemView {
         if (!this.session?.isReady || !this.session?.engine) return;
         this.session?.setTool(t.k);
         this.updateToolbarState();
-        this.buildDrawer(this.drawerEl);
+        // Auto-refresh drawer when switching tools while drawer is open
+        if (this.isDrawerOpen) this.buildDrawer(this.drawerEl);
         // Cursor auto-updates via session.subscribeViewUI — no explicit call needed
         window.requestAnimationFrame(() => this.cacheToolbarSize());
       };
     }
-    this.toolbarEl.createEl("button", { text: "\u2699\uFE0F", title: "设置" }).onclick = () => this.toggleDrawer();
+    // ✨ Beautify — toggle + open dedicated panel
+    const beautyBtn = this.toolbarEl.createEl("button", { text: "\u2728", title: "字迹美颜" });
+    beautyBtn.setAttribute("data-tool", "beautify");
+    if (beautifyConfig.enabled) beautyBtn.addClass("is-active");
+    beautyBtn.onclick = () => {
+      const active = toggleBeautify();
+      beautyBtn.classList.toggle("is-active", active);
+      if (this.session) { this.session.markDirty(); this.session.requestFullRebuild(); }
+      // Open drawer with beautify panel
+      this._drawerMode = 'beautify';
+      this.isDrawerOpen = true;
+      this.drawerEl.classList.add("is-visible");
+      this.buildDrawer(this.drawerEl);
+    };
+    this.toolbarEl.createEl("button", { text: "\u2699\uFE0F", title: "设置" }).onclick = () => {
+      this._drawerMode = 'tool';
+      this.toggleDrawer();
+    };
 
     // ── Drag: pure state mutation ──
     this.toolbarEl.onpointerdown = (ev: PointerEvent) => {
@@ -3504,6 +3959,62 @@ class CanvasView extends ItemView {
       if (this.ts.dock !== "free" && !this.ts.dragging)
         this.toolbarEl.classList.add("compact");
     };
+  }
+
+  // ============================================================
+  //  Undo Bar — bottom-left action buttons
+  // ============================================================
+
+  private undoBarEl: HTMLElement | null = null;
+  private _syncUndoBar: (() => void) | null = null;
+
+  private buildUndoBar(parent: HTMLElement) {
+    this.undoBarEl = parent.createEl("div", { cls: "reminote-undo-bar" });
+
+    const undoBtn = this.undoBarEl.createEl("button", { text: "\u21A9\uFE0F", title: "撤销 (Ctrl+Z)" });
+    const redoBtn = this.undoBarEl.createEl("button", { text: "\u21AA\uFE0F", title: "重做 (Ctrl+Y)" });
+    const clearBtn = this.undoBarEl.createEl("button", { text: "\uD83D\uDDD1\uFE0F", title: "清空画布" });
+    clearBtn.classList.add("gn-clear-btn");
+
+    const refreshUndoState = () => {
+      const eng = this.session?.engine;
+      if (undoBtn) undoBtn.disabled = !eng?.canUndo;
+      if (redoBtn) redoBtn.disabled = !eng?.canRedo;
+    };
+    this._syncUndoBar = refreshUndoState;
+
+    undoBtn.onclick = () => {
+      const eng = this.session?.engine;
+      if (!eng?.canUndo) return;
+      eng.undo();
+      this.session?.markDirty();
+      this.session?.requestFullRebuild();
+      refreshUndoState();
+    };
+
+    redoBtn.onclick = () => {
+      const eng = this.session?.engine;
+      if (!eng?.canRedo) return;
+      eng.redo();
+      this.session?.markDirty();
+      this.session?.requestFullRebuild();
+      refreshUndoState();
+    };
+
+    clearBtn.onclick = () => {
+      const eng = this.session?.engine;
+      if (!eng || eng.strokes.length === 0) return;
+      // Push all strokes to undo stack then clear
+      while (eng.strokes.length > 0) {
+        eng.removeStroke(eng.strokes[eng.strokes.length - 1].id);
+      }
+      this.session?.markDirty();
+      this.session?.requestFullRebuild();
+      refreshUndoState();
+    };
+
+    // Initial state
+    refreshUndoState();
   }
 
   // ============================================================
@@ -3576,7 +4087,7 @@ class CanvasView extends ItemView {
 
   private updateToolbarState() {
     const curTool = this.session?.getActiveToolId();
-    this.containerEl.querySelectorAll(".goodnote-floating-toolbar button").forEach((b: Element) => {
+    this.containerEl.querySelectorAll(".reminote-floating-toolbar button").forEach((b: Element) => {
       const el = b as HTMLButtonElement;
       const toolId = el.getAttribute("data-tool");
       if (toolId) el.classList.toggle("is-active", toolId === curTool);
@@ -3586,6 +4097,8 @@ class CanvasView extends ItemView {
   private toggleDrawer() {
     this.isDrawerOpen = !this.isDrawerOpen;
     this.drawerEl.classList.toggle("is-visible", this.isDrawerOpen);
+    // Always rebuild for the current active tool when opening
+    if (this.isDrawerOpen) this.buildDrawer(this.drawerEl);
   }
 
   // ==========================================================
@@ -3594,89 +4107,248 @@ class CanvasView extends ItemView {
 
   private buildDrawer(container: HTMLElement) {
     container.empty();
+
+    // Beautify mode — standalone panel
+    if (this._drawerMode === 'beautify') {
+      this.buildBeautifyPanel(container);
+      return;
+    }
+
+    // Tool mode — show settings for active tool
     const toolId = this.session?.getActiveToolId();
     if (toolId === 'pen') {
-      this.buildPenPanel(container);
+      this.buildBrushPanel(container);
     } else if (toolId === 'eraser') {
       this.buildEraserPanel(container);
     } else {
       container.createEl("h4", { text: "\u270B 手掌" });
-      container.createEl("p", { text: "拖动画布", cls: "goodnote-placeholder" });
+      container.createEl("p", { text: "拖动画布", cls: "reminote-placeholder" });
     }
   }
 
-  // ── Pen Panel — reads/writes via session.toolManager ──
+  // ── Brush Panel — PS-style: size, opacity, color picker, presets ──
 
-  /** Derive UI-friendly inkFlow (0-100) from engine spacing param. */
-  private getPenInkFlow(): number {
+  private getPenFullParams(): HandwritingParams {
     const pen = this.session?.toolManager.get('pen');
-    const ps = pen?.settings as HandwritingParams | undefined;
-    return ps ? Math.round(((6 - ps.spacing) / 5) * 100) : 70;
-  }
-  private getPenStability(): number {
-    const pen = this.session?.toolManager.get('pen');
-    const ps = pen?.settings as HandwritingParams | undefined;
-    return ps ? Math.round(((0.55 - ps.cornerKeep) / 0.45) * 100) : 65;
-  }
-  private getPenStrokeWidth(): number {
-    const pen = this.session?.toolManager.get('pen');
-    const ps = pen?.settings as HandwritingParams | undefined;
-    return ps?.strokeWidth ?? 2;
+    return (pen?.settings as HandwritingParams) ?? CanvasPolicy.getDefaults();
   }
 
-  /** Apply pen params to both Engine and Tool settings via session. */
-  private applyPenParams(inkFlow: number, stability: number, strokeWidth: number) {
+  private applyPenFullParams(patch: Partial<HandwritingParams>) {
     const s = this.session;
     if (!s?.isAlive?.() || !s?.engine) return;
-    const t = inkFlow / 100;
-    const st = stability / 100;
-    const spacing    = +(6 - t * 5).toFixed(1);
-    const smoothness = +(0.15 + t * 0.6).toFixed(2);
-    const cornerKeep = +(0.55 - st * 0.45).toFixed(2);
-    const params = { spacing, smoothness, strokeWidth, cornerKeep };
+    const current = this.getPenFullParams();
+    const params = { ...current, ...patch };
     s.engine.setParams(params);
     s.updateToolSettings('pen', params);
+    s.syncViewState();
     s.markDirty();
   }
 
-  private buildPenPanel(container: HTMLElement) {
-    container.createEl("h4", { text: "\u270D\uFE0F 钢笔" });
+  private buildBrushPanel(container: HTMLElement) {
+    const ps = this.getPenFullParams();
 
-    const presets = [
-      { label: "圆珠笔", ink: 60, stab: 70, w: 1.5 },
-      { label: "钢笔",   ink: 85, stab: 50, w: 2.5 },
-      { label: "铅笔",   ink: 25, stab: 30, w: 1.8 },
+    // ── Brush Presets ──
+    const presetRow = container.createEl("div", { cls: "gn-brush-preset-row" });
+    const brushPresetsData = [
+      { id: 'brush-pen', label: '\u6BDB\u7B14', desc: '\u4E66\u6CD5\u611F\uFF0C\u4E24\u5934\u5C16\u4E2D\u95F4\u9971\u6EE1' },
+      { id: 'ps-default', label: 'PS\u9ED8\u8BA4', desc: '\u5300\u5300\u9971\u6EE1\uFF0C\u8D77\u6536\u5E72\u8106' },
     ];
-    const presetRow = container.createEl("div", { cls: "goodnote-drawer-presets" });
-    for (const p of presets) {
-      const btn = presetRow.createEl("button", { text: p.label });
+    const activeBrushType = (ps as any).brushType ?? 'brush-pen';
+    for (const bp of brushPresetsData) {
+      const btn = presetRow.createEl("button", { text: bp.label });
+      if (bp.id === activeBrushType) btn.addClass("is-active");
+      btn.title = bp.desc;
       btn.onclick = () => {
-        this.applyPenParams(p.ink, p.stab, p.w);
-        this.syncPenSliders();
+        this.applyPenFullParams({
+          brushType: bp.id,
+          strokeWidth: bp.id === 'brush-pen' ? 3.5 : 2.5,
+          smoothness: bp.id === 'brush-pen' ? 0.6 : 0.4,
+          spacing: bp.id === 'brush-pen' ? 1 : 2,
+          cornerKeep: 0.2,
+          opacity: 0.92,
+          color: ps.color ?? '#1a1a1a',
+        });
+        this.buildDrawer(container.closest('.reminote-canvas-drawer') as HTMLElement);
       };
     }
 
-    this.buildSlider(container, "墨流", "粗涩 → 顺滑", 0, 100, this.getPenInkFlow(),
-      (v) => this.applyPenParams(v, this.getPenStability(), this.getPenStrokeWidth()));
+    // ── Size slider ──
+    this.buildSlider(container, "大小", "细 → 粗", 0.5, 12, ps.strokeWidth,
+      (v) => {
+        this.applyPenFullParams({ strokeWidth: v });
+        const s = this.session; if (s) s.syncViewState();
+      }, 0.5);
 
-    this.buildSlider(container, "稳定性", "自然 → 精准", 0, 100, this.getPenStability(),
-      (v) => this.applyPenParams(this.getPenInkFlow(), v, this.getPenStrokeWidth()));
+    // ── Opacity slider ──
+    this.buildSlider(container, "透明度", "淡 → 浓", 10, 100, Math.round((ps.opacity ?? 1) * 100),
+      (v) => this.applyPenFullParams({ opacity: v / 100 }));
 
-    this.buildSlider(container, "笔触宽度", "", 0.5, 8, this.getPenStrokeWidth(),
-      (v) => this.applyPenParams(this.getPenInkFlow(), this.getPenStability(), v), 0.5);
+    // ── Color picker ──
+    this.buildColorPicker(container, ps.color ?? '#1a1a1a',
+      (color) => this.applyPenFullParams({ color }));
+
+    // ── Pressure module ──
+    const pressureSec = container.createEl("div", { cls: "gn-brush-section-label" });
+    pressureSec.setText("🖐️ 压感");
+
+    // Detect stylus capability
+    const hasPen = (window as any).__REMINOTE_HAS_PEN__ ?? false;
+    const penType = (window as any).__REMINOTE_PEN_TYPE__ ?? '未知';
+
+    const statusRow = container.createEl("div", { style: "display:flex;align-items:center;gap:8px;margin:6px 0" } as any);
+    const statusDot = statusRow.createEl("span", { text: hasPen ? "🟢" : "⚪", attr: { style: "font-size:14px" } });
+    statusRow.createEl("span", { text: hasPen ? "已检测到压感笔" : "未检测到压感笔", cls: "reminote-pen-slider-label" });
+
+    const modelRow = container.createEl("div", { style: "display:flex;align-items:center;gap:8px;margin:4px 0" } as any);
+    modelRow.createEl("span", { text: "型号:", cls: "reminote-pen-slider-label" });
+    modelRow.createEl("span", { text: penType, attr: { style: "font-size:11px;opacity:0.7" } });
+
+    // Apple Pencil optimization toggle
+    const appleRow = container.createEl("div", { style: "display:flex;align-items:center;justify-content:space-between;margin:8px 0" } as any);
+    appleRow.createEl("span", { text: "Apple Pencil 优化", cls: "reminote-pen-slider-label" });
+    const appleToggle = appleRow.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
+    appleToggle.checked = (window as any).__REMINOTE_APPLE_PENCIL_MODE__ ?? true;
+    appleToggle.onchange = () => {
+      (window as any).__REMINOTE_APPLE_PENCIL_MODE__ = appleToggle.checked;
+    };
   }
 
-  private syncPenSliders() {
-    const map: Record<string, number> = {
-      "墨流": this.getPenInkFlow(),
-      "稳定性": this.getPenStability(),
-      "笔触宽度": this.getPenStrokeWidth(),
+  // ── Beautify Panel (独立) ──
+
+  private buildBeautifyPanel(container: HTMLElement) {
+    const cfg = redrawOrchestrator.config;
+
+    // ── Enable toggle ──
+    const row = container.createEl("div", { cls: "reminote-pen-slider" });
+    const lbl = row.createEl("div", { cls: "reminote-pen-slider-header" });
+    lbl.createEl("span", { text: "✨ 笔迹重绘（生物动画）", cls: "reminote-pen-slider-label" });
+    const check = row.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
+    check.checked = cfg.enabled;
+    check.onchange = () => {
+      cfg.enabled = check.checked;
+      beautifyConfig.enabled = check.checked;
+      if (!check.checked) redrawOrchestrator.reset();
     };
-    this.drawerEl.querySelectorAll("input[type=range]").forEach((s: Element) => {
-      const el = s as HTMLInputElement;
-      const key = el.getAttribute("data-slider-key");
-      if (key && map[key] !== undefined) el.value = String(map[key]);
-    });
+
+    // ── Font style grid ──
+    const styleSec = container.createEl("div", { cls: "gn-brush-section-label" });
+    styleSec.setText("🎨 字体风格");
+    const styleDesc = container.createEl("div", { cls: "gn-brush-hint" });
+    styleDesc.setText("写完一个字后，笔画像生物一样爬动变形为目标字体");
+
+    const styleGrid = container.createEl("div", { cls: "gn-font-style-grid" });
+
+    const fontStyles: { id: FontStyleId; label: string; desc: string; icon: string }[] = [
+      { id: 'roundCute', label: '圆形可爱体', desc: '圆润可爱，粗细均匀', icon: '🍬' },
+      { id: 'kaiShu',    label: '正楷',       desc: '端庄工整，横细竖粗', icon: '✒️' },
+      { id: 'xingShu',   label: '行书',       desc: '行云流水，笔意连贯', icon: '🌊' },
+      { id: 'caoShu',    label: '草书',       desc: '狂放不羁，笔走龙蛇', icon: '🐉' },
+    ];
+
+    for (const fs of fontStyles) {
+      const card = styleGrid.createEl("button", { cls: "gn-font-style-card" });
+      if (cfg.styleId === fs.id) card.addClass("is-active");
+
+      const iconEl = card.createEl("span", { cls: "gn-font-style-icon", text: fs.icon });
+      const labelEl = card.createEl("span", { cls: "gn-font-style-label", text: fs.label });
+      const descEl = card.createEl("span", { cls: "gn-font-style-desc", text: fs.desc });
+
+      card.onclick = () => {
+        cfg.styleId = fs.id;
+        redrawOrchestrator.setFontStyle(fs.id);
+        // Refresh UI to update active state
+        this.buildDrawer(this.drawerEl);
+      };
+    }
+
+    // ── Beautify strength ──
+    this.buildSlider(container, "美化强度", "柔和 → 强力", 0, 1, cfg.beautifyStrength,
+      (v) => { cfg.beautifyStrength = v; }, 0.1);
+
+    // ── Stylize strength ──
+    this.buildSlider(container, "风格化强度", "保留手写 → 完全风格化", 0, 1, cfg.stylizeStrength,
+      (v) => { cfg.stylizeStrength = v; }, 0.1);
+
+    // ── Pause duration ──
+    this.buildSlider(container, "停笔等待", "200ms → 1500ms", 200, 1500, cfg.pauseMs,
+      (v) => { cfg.pauseMs = v; });
+
+    // ── Info text ──
+    const infoBox = container.createEl("div", { cls: "gn-beautify-info" });
+    infoBox.setText("💡 写完笔画 → 呼吸动画 → 停顿 → 蠕变动画变形为优美形态 → 完成脉冲。100%触发，无需识别。");
+  }
+
+  // ── Color Picker Widget (HSL ring) ──
+
+  // ── HSL/RGB color helpers ──
+
+  private buildColorPicker(container: HTMLElement, currentColor: string, onChange: (hex: string) => void) {
+    const initialHsl = hexToHsl(currentColor);
+    let hue = initialHsl.h;
+    let sat = 1.0;
+    let bri = 0.5;
+    // Parse current color to set proper sat/bri
+    if (initialHsl.l < 0.1) { bri = 0; sat = 0; }
+    else if (initialHsl.l > 0.9) { bri = 1; sat = 0; }
+    else { bri = initialHsl.l; sat = initialHsl.s; }
+
+    const wrap = container.createEl("div", { cls: "gn-color-picker" });
+
+    const update = () => {
+      const hex = hslToHex(hue, sat, bri);
+      preview.style.background = hex;
+      hexInput.value = hex;
+      onChange(hex);
+    };
+
+    // ── Hue slider ──
+    const hueRow = wrap.createEl("div"); hueRow.style.cssText = "display:flex;align-items:center;gap:8px";
+    hueRow.createEl("span", { text: "色相", cls: "reminote-pen-slider-label" });
+    const hueSlider = hueRow.createEl("input", { attr: { type: "range", min: "0", max: "360" } }) as HTMLInputElement;
+    hueSlider.value = String(Math.round(hue));
+    hueSlider.style.cssText = "flex:1;height:14px;-webkit-appearance:none;background:linear-gradient(to right,red,yellow,lime,cyan,blue,magenta,red);border-radius:7px";
+    const onHue = () => { hue = parseInt(hueSlider.value); updateSatBg(); updateBriBg(); update(); };
+    hueSlider.oninput = onHue;
+
+    // ── Saturation slider ──
+    const satRow = wrap.createEl("div"); satRow.style.cssText = "display:flex;align-items:center;gap:8px";
+    satRow.createEl("span", { text: "饱和度", cls: "reminote-pen-slider-label" });
+    const satSlider = satRow.createEl("input", { attr: { type: "range", min: "0", max: "100" } }) as HTMLInputElement;
+    satSlider.value = String(Math.round(sat * 100));
+    satSlider.style.flex = "1";
+    const updateSatBg = () => { satSlider.style.background = `linear-gradient(to right, #888, ${hslToHex(hue, 1, 0.5)})`; };
+    updateSatBg();
+    const onSat = () => { sat = parseInt(satSlider.value) / 100; updateBriBg(); update(); };
+    satSlider.oninput = onSat;
+
+    // ── Brightness slider ──
+    const briRow = wrap.createEl("div"); briRow.style.cssText = "display:flex;align-items:center;gap:8px";
+    briRow.createEl("span", { text: "明度", cls: "reminote-pen-slider-label" });
+    const briSlider = briRow.createEl("input", { attr: { type: "range", min: "0", max: "100" } }) as HTMLInputElement;
+    briSlider.value = String(Math.round(bri * 100));
+    briSlider.style.flex = "1";
+    const updateBriBg = () => { briSlider.style.background = `linear-gradient(to right,#000,${hslToHex(hue, sat, 0.5)},#fff)`; };
+    updateBriBg();
+    briSlider.oninput = () => { bri = parseInt(briSlider.value) / 100; update(); };
+
+    // ── Hex input + preview ──
+    const hexRow = wrap.createEl("div", { cls: "gn-color-hex-row" });
+    const hexInput = hexRow.createEl("input", { cls: "gn-color-hex-input", attr: { type: "text", value: currentColor } }) as HTMLInputElement;
+    const preview = hexRow.createEl("div", { cls: "gn-color-preview" });
+    preview.style.background = currentColor;
+    hexInput.onchange = () => {
+      const hex = hexInput.value;
+      if (/^#[0-9a-fA-F]{6}$/.test(hex)) {
+        const hsl = hexToHsl(hex);
+        hue = hsl.h; sat = hsl.s; bri = hsl.l;
+        hueSlider.value = String(Math.round(hue));
+        satSlider.value = String(Math.round(sat * 100));
+        briSlider.value = String(Math.round(bri * 100));
+        updateSatBg(); updateBriBg();
+        preview.style.background = hex;
+        onChange(hex);
+      }
+    };
   }
 
   // ── Eraser Panel — reads/writes via session.toolManager ──
@@ -3688,7 +4360,7 @@ class CanvasView extends ItemView {
     const es = eraser.settings as EraserSettings;
     container.createEl("h4", { text: "\uD83E\uDDF9 橡皮" });
 
-    const modeRow = container.createEl("div", { cls: "goodnote-drawer-presets" });
+    const modeRow = container.createEl("div", { cls: "reminote-drawer-presets" });
     for (const m of [
       { k: "stroke" as EraserMode, l: "整体擦除" },
       { k: "point" as EraserMode, l: "局部擦除" },
@@ -3721,10 +4393,10 @@ class CanvasView extends ItemView {
     onChange: (v: number) => void,
     step = 1
   ) {
-    const row = container.createEl("div", { cls: "goodnote-pen-slider" });
-    const hdr = row.createEl("div", { cls: "goodnote-pen-slider-header" });
-    hdr.createEl("span", { cls: "goodnote-pen-slider-label", text: label });
-    if (hint) hdr.createEl("span", { cls: "goodnote-pen-slider-hint", text: hint });
+    const row = container.createEl("div", { cls: "reminote-pen-slider" });
+    const hdr = row.createEl("div", { cls: "reminote-pen-slider-header" });
+    hdr.createEl("span", { cls: "reminote-pen-slider-label", text: label });
+    if (hint) hdr.createEl("span", { cls: "reminote-pen-slider-hint", text: hint });
     const input = row.createEl("input", { type: "range" }) as HTMLInputElement;
     input.min = String(min); input.max = String(max); input.step = String(step);
     input.value = String(value);
@@ -3746,13 +4418,16 @@ interface UIState {
 }
 
 // ============================================================
-//  GoodNoteMaxPlugin
+//  RemiNotePlugin
 // ============================================================
 
 type EventHandler = () => void;
 
-export default class GoodNoteMaxPlugin extends Plugin {
-  private _initialized = false;
+export default class RemiNotePlugin extends Plugin {
+  _initialized = false;
+  _uiController: CanvasUIController | null = null;
+  _urs: UIRuntimeStabilizer | null = null;
+  _orchestrator: RuntimeOrchestrator | null = null;
   private notebooks: Notebook[] = [];
   private selectedNotebookId: string | null = null;
   private listeners = new Map<string, EventHandler[]>();
@@ -3814,7 +4489,9 @@ export default class GoodNoteMaxPlugin extends Plugin {
 
   private async resolveNotebookPath(id: string): Promise<string | undefined> {
     const adapter = this.app.vault.adapter;
-    const files = (await adapter.list('GoodNoteMax')).files.filter((f: string) => f.endsWith('.gnnote'));
+    const files = (await adapter.list(FileGateway.DIR)).files.filter((f: string) =>
+      f.endsWith('.remi') || f.endsWith('.gnnote')
+    );
     for (const f of files) {
       try {
         const raw = await adapter.read(f);
@@ -3830,11 +4507,11 @@ export default class GoodNoteMaxPlugin extends Plugin {
     const nb = this.notebooks.find((n) => n.id === id);
     if (!nb) return;
     const adapter = this.app.vault.adapter;
-    const files = (await adapter.list('GoodNoteMax')).files;
-    if (files.some((f: string) => f.endsWith(`${trimmed}.gnnote`))) return;
+    const files = (await adapter.list(FileGateway.DIR)).files;
+    if (files.some((f: string) => f.endsWith(`${trimmed}.remi`))) return;
     const oldPath = await this.resolveNotebookPath(id);
     if (!oldPath) return;
-    const newPath = `GoodNoteMax/${trimmed}.gnnote`;
+    const newPath = `${FileGateway.DIR}/${trimmed}.remi`;
     this.isInternalRename = true;
     this.isInternalWrite = true;
     try {
@@ -3860,12 +4537,17 @@ export default class GoodNoteMaxPlugin extends Plugin {
     if (!this.safeBootCheck('handleVaultEvent')) return;
     if (this.isInternalRename || this.isInternalWrite) return;
     const path: string = file?.path ?? '';
-    if (!path.startsWith('GoodNoteMax/') || !path.endsWith('.gnnote')) return;
+    if (!path.startsWith(`${FileGateway.DIR}/`) || (!path.endsWith('.remi') && !path.endsWith('.gnnote'))) return;
 
     if (type === 'delete') {
       // Bug B Fix: 使用内存状态查找 notebook，不依赖文件读取（文件已删除）
-      const filename = path.replace(/^GoodNoteMax\//, '').replace(/\.gnnote$/, '');
-      const match = this.notebooks.find((n) => n.name === filename || `${n.name}.gnnote` === path.replace(/^GoodNoteMax\//, ''));
+      const barePath = path.replace(new RegExp(`^${FileGateway.DIR}/`), '');
+      const filename = barePath.replace(/\.(remi|gnnote)$/, '');
+      const match = this.notebooks.find((n) =>
+        n.name === filename ||
+        `${n.name}.remi` === barePath ||
+        `${n.name}.gnnote` === barePath
+      );
       if (!match) return;
       this.notebooks = this.notebooks.filter((n) => n.id !== match.id);
       if (this.selectedNotebookId === match.id) { this.selectedNotebookId = null; this.emit('selection-changed'); }
@@ -4023,10 +4705,12 @@ export default class GoodNoteMaxPlugin extends Plugin {
     this._initialized = true;
     console.log('[BOOT] init start');
 
+
     await this._boot();
   }
 
   private async _boot() {
+    installDebugGuard();
     console.log('[BOOT] running core init');
 
     this.fileGateway = new FileGateway(this.app);
@@ -4039,7 +4723,42 @@ export default class GoodNoteMaxPlugin extends Plugin {
     this.registerView(PAGE_VIEW_TYPE, (leaf) => new PageView(leaf, this));
     this.registerView(CANVAS_VIEW_TYPE, (leaf) => new CanvasView(leaf, this));
 
-    this.addRibbonIcon('pen-tool', 'GoodNote Max', () => this.openBothViews());
+    this.addRibbonIcon('pen-tool', 'RemiNote', () => this.openBothViews());
+    // 🟦 Single UI Owner: CanvasUIController owns dashboard lifecycle
+    if (!this._uiController) this._uiController = new CanvasUIController();
+    // ⚠️ UIRuntimeStabilizer disabled — RuntimeOrchestrator owns UI sync + recovery
+    // (was: if (!this._urs) { this._urs = new UIRuntimeStabilizer(); this._urs.start(this._dashboard); })
+
+    // ── 🟥 Runtime Orchestrator: Single Frame Authority ──
+    if (!this._orchestrator) {
+      this._orchestrator = new RuntimeOrchestrator({ debug: false });
+      this._orchestrator.createAndBindShadowHook();
+      this._orchestrator.bindUIController(this._uiController!);
+      this._orchestrator.bindSessionProvider(() => {
+        const registry = CanvasSessionRegistry.getInstance();
+        const session = registry.activeSession;
+        return (session && !session.destroyed) ? (session as any) : null;
+      });
+      this._orchestrator.start();
+      console.log('[BOOT] 🟥 Runtime Orchestrator: Single Frame Authority ACTIVE');
+
+      // 🟦 DevTools global access
+      (window as any).__debug = {
+        orchestrator: this._orchestrator,
+        trace: this._orchestrator.debugLayer,
+        replay: this._orchestrator.replay,
+        ui: this._uiController,
+        get session() {
+          const r = CanvasSessionRegistry.getInstance();
+          return r.activeSession && !r.activeSession.destroyed ? r.activeSession : null;
+        },
+      };
+      console.log('[BOOT] 🔍 DevTools: window.__debug ready');
+    }
+
+    // 🟦 Start global coordinate pointer stream
+    startPointerStream();
+    console.log('[BOOT] 📐 Coordinate Input System ACTIVE');
 
     this.app.workspace.onLayoutReady(() => {
       this.openBothViews();
@@ -4060,21 +4779,15 @@ export default class GoodNoteMaxPlugin extends Plugin {
       const canvasCount = activeDocument.querySelectorAll('canvas').length;
       const sessionAlive = !!(registry.activeSession && !registry.activeSession.destroyed);
 
-      console.assert(sessionAlive || canvasCount === 0,
-        '❌ [HEALTH] No active session but canvases exist in DOM');
-      if (sessionAlive) {
-        console.assert(canvasCount === 1,
-          `❌ [HEALTH] Canvas count ≠ 1 (actual: ${canvasCount})`);
-      }
-
-      console.log('[SESSION HEALTH]', {
-        canvasCount,
-        sessionAlive,
-        sessionDestroyed: registry.activeSession?.destroyed ?? null,
-        sessionId: registry.sessionId || 'none',
-        timestamp: new Date().toISOString(),
-      });
     }, 5000);
+  }
+
+  async onunload(): Promise<void> {
+    stopPointerStream();
+    (window as any).__REMINOTE_CURSOR_SINGLETON__ = false;
+    (window as any).__CURSOR_MOVE_LOCK__ = false;
+    if (this._orchestrator) { this._orchestrator.destroy(); this._orchestrator = null; }
+    console.log('[PLUGIN] 💀 unloaded — global locks released');
   }
 
   private async openBothViews() {

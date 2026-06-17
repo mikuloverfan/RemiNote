@@ -1,10 +1,11 @@
 {
-  "name": "obsidian-goodnote-max",
+  "name": "obsidian-reminote",
   "version": "1.0.0",
-  "description": "GoodNote Max - Obsidian plugin",
+  "description": "RemiNote - Obsidian plugin",
   "main": "main.js",
   "scripts": {
-    "build": "esbuild main.ts --bundle --external:obsidian --platform=browser --format=cjs --outfile=main.js"
+    "build": "esbuild main.ts --bundle --external:obsidian --platform=browser --format=cjs --outfile=dist/main.js",
+    "sync": "node sync.js"
   },
   "devDependencies": {
     "esbuild": "^0.20.0",
@@ -13,5 +14,8 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC"
+  "license": "ISC",
+  "dependencies": {
+    "perfect-freehand": "^1.2.3"
+  }
 }
