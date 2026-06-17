@@ -6,3 +6,4 @@ dist/
 .obsidian/workspace.json
 main.js.map
 *.tsbuildinfo
+.DS_Store
